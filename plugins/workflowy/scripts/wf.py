@@ -125,9 +125,19 @@ def conf(env, fname):
     return p.read_text(encoding="utf-8").strip() if p.exists() else None
 
 
-def scrub(s, n=400):
-    s = SECRET.sub("<<redacted>>", str(s or "")).replace("\n", " / ")
+def scrub(s, n=400, lines=False):
+    """비밀값을 가리고 길이를 자른다. 제목은 한 줄이어야 하고, 노트(lines=True)는 줄바꿈을 살린다."""
+    s = SECRET.sub("<<redacted>>", str(s or "")).replace("\r\n", "\n")
+    if not lines:
+        s = s.replace("\n", " / ")
     return (s[:n] + "…") if len(s) > n else s
+
+
+def plain(s):
+    """노트용: Workflowy 노트는 마크다운을 그리지 않으므로 기호만 걷어낸다."""
+    s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s)            # [x](url) -> x
+    s = re.sub(r"^#{1,6}\s+", "", s, flags=re.M)               # 제목 기호
+    return re.sub(r"\*\*|__|`", "", s)
 
 
 def label(s, n=400):
@@ -391,7 +401,9 @@ def h_prompt(ev, st, sid):
         a = (st.get("agents") or {}).get((st.get("agent_ids") or {}).get(m.group(1)), {})
         desc = a.get("title", "에이전트").split(": ", 1)[-1]
         hm = f"{datetime.now():%H:%M}"
-        nid = node(st["session_node"], hm, note=f"\U0001f916 {desc} 의 보고에 답하는 중")
+        # 계기(어느 보고를 받았는지)는 진행 중일 때만 보인다. 답변이 그 보고에 관한 것이라는 뜻은 아니므로
+        # 끝나면 노트에는 답변 전문만 남긴다 (여러 보고를 취합한 답변일 수 있다).
+        nid = node(st["session_node"], hm, note=f"\U0001f916 {desc} 의 보고를 받아 작업 중")
         turns.append({"id": nid, "hm": hm, "label": f"{hm} \U0001f916 {html_label(desc, 100)} 의 보고에 답함",
                       "kind": "handback", "agent": desc, "key": f'<agent-message from="{m.group(1)}"',
                       "ts": time.time()})
@@ -409,7 +421,7 @@ def h_prompt(ev, st, sid):
     # 요청 전문은 노트에 있으므로 제목은 시각만 두고, 턴이 끝나면 응답의 첫 문장으로 채운다.
     p = norm(ev.get("prompt"))
     hm = f"{datetime.now():%H:%M}"
-    nid = node(st["session_node"], hm, note=scrub(ev.get("prompt"), 2000))
+    nid = node(st["session_node"], hm, note=scrub(ev.get("prompt"), 2000, lines=True))
     turns.append({
         "id": nid, "hm": hm, "label": f"{hm} " + html_label(ev.get("prompt"), 110),
         # 슬래시 명령은 transcript 에 이름과 인자가 따로 남으므로 이름만 맞춘다
@@ -449,8 +461,7 @@ def h_stop(ev, st, sid):
         elif titled:                 close(t, "↳ 앞 요청과 함께 처리", st, now)
         elif reply:
             # 보고에 답한 턴은 요청이 없으므로 노트에 답변 전문을 남긴다 (요청 턴의 노트는 요청 전문)
-            note = (f"\U0001f916 {t['agent']} 의 보고에 답함\n\n{scrub(reply, 6000)}"
-                    if t.get("kind") == "handback" else None)
+            note = plain(scrub(reply, 6000, lines=True)) if t.get("kind") == "handback" else None
             close(t, html_label(headline(reply), 100), st, now, note); titled = True
         else:
             close(t, None, st, now)              # 응답을 못 찾으면 요청 앞부분을 쓴다
@@ -510,7 +521,7 @@ def h_note(text, st, sid):
     if not parent:
         return
     node(parent, "▸ " + label(text, 300),
-         note=scrub(text, 2000) if len(text) > 300 else None)
+         note=scrub(text, 2000, lines=True) if len(text) > 300 else None)
 
 
 # 서브에이전트: 일은 서브에이전트가 하고 기록은 메인 세션이 한다.
@@ -525,7 +536,7 @@ def h_agent_launch(ev, st, sid):
         return                                   # 서브에이전트가 띄운 것은 메인 세션의 일이 아니다
     i = ev.get("tool_input") or {}
     head = f"{datetime.now():%H:%M} \U0001f916 {i.get('subagent_type') or 'general-purpose'}: "
-    ask = scrub(i.get("prompt"), 1500)
+    ask = scrub(i.get("prompt"), 1500, lines=True)
     nid = node(st["session_node"], head + label(i.get("description"), 100) + " · 진행 중",
                note="지시: " + ask)
     st.setdefault("agents", {})[ev.get("tool_use_id")] = {
@@ -541,7 +552,7 @@ def finish_agent(a, until, status="completed", report=None):
         tail = f" <i>· {({'failed': '실패', 'killed': '중단됨', 'stopped': '중단됨'}).get(status, status)}</i>"
     kw = {"name": a["title"] + tail}
     if report:
-        kw["note"] = f"결과: {scrub(report, 6000)}\n\n지시: {a.get('ask', '')}"
+        kw["note"] = f"결과: {plain(scrub(report, 6000, lines=True))}\n\n지시: {a.get('ask', '')}"
     edit(a["id"], **kw)
 
 
