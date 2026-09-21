@@ -431,7 +431,7 @@ def h_end(ev, st, sid):
 
 
 def current(st):
-    """메모와 에이전트를 붙일 곳: 열린 턴 중 마지막, 없으면 세션."""
+    """메모를 붙일 곳: 열린 턴 중 마지막, 없으면 세션."""
     return next((t["id"] for t in reversed(st.get("turns") or []) if not t.get("closed")),
                 st.get("session_node"))
 
@@ -446,6 +446,8 @@ def h_note(text, st, sid):
 
 # 서브에이전트: SubagentStart 에는 에이전트 종류만 오므로, 띄울 때(PreToolUse) 적은 설명을
 # 받아 두었다가 시작될 때 노드를 만들고, SubagentStop 에서 소요 시간을 붙여 체크한다.
+# 에이전트는 턴이 끝난 뒤에도 일할 수 있고 턴 노드는 접혀 보이므로, 턴 아래가 아니라
+# 세션 바로 아래(턴과 같은 단계)에 둔다. 그래야 일하는 동안 체크 안 된 항목으로 보인다.
 
 
 def h_agent_launch(ev, st, sid):
@@ -461,33 +463,40 @@ def h_agent_launch(ev, st, sid):
 def h_agent_start(ev, st, sid):
     wait, typ = st.get("agents_wait") or [], ev.get("agent_type") or ""
     j = next((j for j, w in enumerate(wait) if w["type"] == typ), 0 if wait else None)
-    if j is None or not current(st):
+    if j is None or not st.get("session_node"):
         return                                   # Agent 도구로 띄운 게 아닌 것(워크플로 등)은 기록하지 않는다
     w = wait.pop(j)
-    head = f"\U0001f916 {typ or w['type']}: "
-    nid = node(current(st), head + label(w["desc"], 100), note=scrub(w["prompt"], 2000))
-    a = {"id": nid, "title": head + html_label(w["desc"], 100), "ts": time.time()}
+    head = f"{datetime.now():%H:%M} \U0001f916 {typ or w['type']}: "
+    ask = scrub(w["prompt"], 1500)
+    nid = node(st["session_node"], head + label(w["desc"], 100), note="지시: " + ask)
+    a = {"id": nid, "title": head + html_label(w["desc"], 100), "ts": time.time(), "ask": ask}
     ended = (st.get("agents_ended") or {}).pop(ev.get("agent_id"), None)
     if ended:                                    # Stop 훅이 먼저 처리된 아주 짧은 에이전트
-        finish_agent(a, ended)
+        finish_agent(a, ended["ts"], ended.get("result"))
     else:
         st.setdefault("agents", {})[ev.get("agent_id")] = a
     save(sid, st)
 
 
-def finish_agent(a, until):
-    edit(a["id"], name=f"{a['title']} <i>· {max(0, until - a['ts']) / 60:.0f}분</i>")
+def finish_agent(a, until, result=None):
+    """소요 시간을 붙여 체크한다. 에이전트가 알아 온 내용은 노트 첫 줄에 둬서 접혀 있어도 보이게 한다."""
+    kw = {"name": f"{a['title']} <i>· {max(0, until - a['ts']) / 60:.0f}분</i>"}
+    if result:
+        kw["note"] = f"결과: {scrub(result, 6000)}\n\n지시: {a.get('ask', '')}"
+    edit(a["id"], **kw)
     done(a["id"])
 
 
 def h_agent_stop(ev, st, sid):
     a = (st.get("agents") or {}).pop(ev.get("agent_id"), None)
+    result = ev.get("last_assistant_message")
     if a:
-        finish_agent(a, time.time())
+        finish_agent(a, time.time(), result)
     else:                                        # 비동기 훅이라 SubagentStart 보다 먼저 올 수 있다
         now = time.time()
-        ended = {k: v for k, v in (st.get("agents_ended") or {}).items() if now - v < 120}
-        ended[ev.get("agent_id")] = now
+        ended = {k: v for k, v in (st.get("agents_ended") or {}).items()
+                 if isinstance(v, dict) and now - v["ts"] < 120}
+        ended[ev.get("agent_id")] = {"ts": now, "result": result}
         st["agents_ended"] = ended
     save(sid, st)
 
