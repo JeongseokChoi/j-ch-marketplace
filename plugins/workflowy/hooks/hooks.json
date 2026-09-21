@@ -20,16 +20,8 @@
     ],
     "PreToolUse": [
       { "matcher": "Agent|Task",
-        "hooks": [{ "type": "command", "timeout": 10,
+        "hooks": [{ "type": "command", "timeout": 15, "async": true,
                     "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" agent-launch" }] }
-    ],
-    "SubagentStart": [
-      { "hooks": [{ "type": "command", "timeout": 15, "async": true,
-                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" agent-start" }] }
-    ],
-    "SubagentStop": [
-      { "hooks": [{ "type": "command", "timeout": 15, "async": true,
-                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" agent-stop" }] }
     ],
     "SessionEnd": [
       { "hooks": [{ "type": "command", "timeout": 10,

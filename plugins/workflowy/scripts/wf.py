@@ -43,11 +43,7 @@ HOOKS = {
     "Notification": [{"matcher": "idle_prompt", "hooks": [
         {"type": "command", "timeout": 15, "async": True, "command": f"{CMD} idle"}]}],
     "PreToolUse": [{"matcher": "Agent|Task", "hooks": [
-        {"type": "command", "timeout": 10, "command": f"{CMD} agent-launch"}]}],
-    "SubagentStart": [{"hooks": [
-        {"type": "command", "timeout": 15, "async": True, "command": f"{CMD} agent-start"}]}],
-    "SubagentStop": [{"hooks": [
-        {"type": "command", "timeout": 15, "async": True, "command": f"{CMD} agent-stop"}]}],
+        {"type": "command", "timeout": 15, "async": True, "command": f"{CMD} agent-launch"}]}],
     "SessionEnd": [{"hooks": [
         {"type": "command", "timeout": 10, "command": f"{CMD} session-end"}]}],
 }
@@ -219,22 +215,27 @@ def when(r):
     except Exception: return None
 
 
+TASK_DONE = re.compile(r"<tool-use-id>([^<]+)</tool-use-id>.*?<status>([^<]+)</status>", re.S)
+
+
 def since_stop(path, st):
-    """마지막 Stop 이후 transcript 를 읽어 (사건 목록, 마지막 응답) 을 돌려준다.
+    """마지막 Stop 이후 transcript 를 읽어 (사건 목록, 마지막 응답, 끝난 도구 호출) 을 돌려준다.
 
     사건은 (종류, 정규화된 텍스트, 시각) 이다. user 는 직접 입력한 요청(type=user 의
     텍스트), 작업 중에 끼어든 대기열 요청(queued_command 첨부), 취소 표시 등이고,
-    assistant 는 Claude 가 응답을 시작했다는 표시다. 판단할 수 없으면 (None, None).
+    assistant 는 Claude 가 응답을 시작했다는 표시다. 판단할 수 없으면 사건 목록은 None.
+    끝난 도구 호출은 {tool_use_id: 상태} 로, 메인 세션이 받은 결과(tool_result)와
+    백그라운드 에이전트의 완료 알림(<task-notification>)에서 모은다.
     """
     try:
         with open(path, "rb") as f:
             f.seek(st.get("offset", 0))
             data = f.read()
     except Exception:
-        return None, None
+        return None, None, {}
     end = data.rfind(b"\n") + 1                  # 쓰는 중인 마지막 줄은 다음 Stop 에서 읽는다
     st["offset"] = st.get("offset", 0) + end
-    seq, reply = [], None
+    seq, reply, finished = [], None, {}
     for line in data[:end].splitlines():
         try:
             r = json.loads(line)
@@ -248,16 +249,23 @@ def since_stop(path, st):
             reply = texts((r.get("message") or {}).get("content")).strip() or reply
             continue
         if r.get("type") == "user":
-            c = texts((r.get("message") or {}).get("content"))
+            content = (r.get("message") or {}).get("content")
+            for b in content if isinstance(content, list) else []:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    out = json.dumps(b.get("content"), ensure_ascii=False)
+                    if "Async agent launched" not in out:   # 백그라운드 에이전트는 완료 알림으로 끝난다
+                        finished[b.get("tool_use_id")] = "failed" if b.get("is_error") else "completed"
+            c = texts(content)
         elif r.get("type") == "attachment" and a.get("type") == "queued_command":
             c = texts(a.get("prompt"))               # 이미지가 붙으면 블록 목록으로 온다
         else:
             continue
         if isinstance(c, str) and c.strip():
+            finished.update(TASK_DONE.findall(c) if "<task-notification>" in c else [])
             seq.append(("user", norm(c), when(r)))
     if not any(k == "user" for k, _, _ in seq):  # 턴마다 요청이 최소 하나는 있다. 없으면 형식이 바뀐 것
-        return None, None
-    return seq, reply
+        return None, None, finished
+    return seq, reply, finished
 
 
 INTERRUPT = "[Request interrupted by user"      # Esc 취소와 도구 거부("... for tool use") 둘 다
@@ -342,7 +350,7 @@ def h_prompt(ev, st, sid):
     if any(not t.get("closed") for t in turns):
         # 취소(Esc)나 도구 거부로 끝난 턴에는 Stop 이 오지 않으므로 다음 요청이 올 때 닫는다.
         # offset 은 Stop 만 옮긴다. 여기서는 복사본으로 읽기만 한다.
-        seq, _ = since_stop(ev.get("transcript_path"), dict(st))
+        seq, _, _ = since_stop(ev.get("transcript_path"), dict(st))
         for t, state, cut in classify(turns, seq or []):
             if state == "interrupted" and not t.get("closed"):
                 close(t, "중단됨", st, cut)
@@ -360,14 +368,23 @@ def h_prompt(ev, st, sid):
 
 
 def h_stop(ev, st, sid):
+    seq, reply, finished = since_stop(ev.get("transcript_path"), st)
+    reply = ev.get("last_assistant_message") or reply
+    now = time.time()
+    # 에이전트의 결과를 받아 응답한 메인 세션이 그 응답으로 보고한다.
+    # 완료 알림만 받고 끝나는 턴은 UserPromptSubmit 이 없어 턴 노드가 없지만, 여기서 처리된다.
+    agents = st.get("agents") or {}
+    for tid, status in finished.items():
+        if tid in agents:
+            finish_agent(agents.pop(tid), now, status, reply)
     turns = st.get("turns") or []
     if not turns:
+        st["last_stop"] = now
+        save(sid, st)
         return
-    seq, reply = since_stop(ev.get("transcript_path"), st)
-    reply = ev.get("last_assistant_message") or reply
     # transcript 를 읽을 수 없으면 전부 닫는다 (미완료로 남는 것보다 낫다).
     rows = classify(turns, seq) if seq else [(t, "ran", None) for t in turns]
-    now, titled, left = time.time(), False, []
+    titled, left = False, []
     for t, state, cut in rows:
         if t.get("closed"):
             continue
@@ -397,7 +414,7 @@ def h_idle(ev, st, sid):
     turns = st.get("turns") or []
     if not any(not t.get("closed") for t in turns):
         return
-    seq, _ = since_stop(ev.get("transcript_path"), dict(st))   # offset 은 Stop 만 옮긴다
+    seq, _, _ = since_stop(ev.get("transcript_path"), dict(st))   # offset 은 Stop 만 옮긴다
     for t, state, cut in classify(turns, seq or [], final=True):
         if t.get("closed") or state is None:
             continue
@@ -414,7 +431,7 @@ def h_end(ev, st, sid):
         except Exception: pass
     turns = st.get("turns") or []
     if any(not t.get("closed") for t in turns):
-        seq, _ = since_stop(ev.get("transcript_path"), st)
+        seq, _, _ = since_stop(ev.get("transcript_path"), st)
         rows = classify(turns, seq, final=True) if seq else [(t, "ran", None) for t in turns]
         # 처리 중이던 턴(Stop 없이 세션이 끝남)도 중단된 것으로 본다
         text = {None: "처리되지 않음", "interrupted": "중단됨", "cancelled": "취소됨", "ran": "중단됨"}
@@ -444,61 +461,34 @@ def h_note(text, st, sid):
          note=scrub(text, 2000) if len(text) > 300 else None)
 
 
-# 서브에이전트: SubagentStart 에는 에이전트 종류만 오므로, 띄울 때(PreToolUse) 적은 설명을
-# 받아 두었다가 시작될 때 노드를 만들고, SubagentStop 에서 소요 시간을 붙여 체크한다.
-# 에이전트는 턴이 끝난 뒤에도 일할 수 있고 턴 노드는 접혀 보이므로, 턴 아래가 아니라
-# 세션 바로 아래(턴과 같은 단계)에 둔다. 그래야 일하는 동안 체크 안 된 항목으로 보인다.
+# 서브에이전트: 일은 서브에이전트가 하고 기록은 메인 세션이 한다.
+# 메인 세션이 에이전트에게 맡기는 순간(PreToolUse) "진행 중" 항목을 만들고, 결과를 받아 응답한
+# Stop 에서 그 응답을 보고로 남기고 체크한다. 둘은 tool_use_id 로 잇는다. 에이전트는 턴이 끝난
+# 뒤에도 일할 수 있고 턴 노드는 접혀 보이므로, 세션 바로 아래(턴과 같은 단계)에 둔다.
 
 
 def h_agent_launch(ev, st, sid):
+    if ev.get("agent_id") or not st.get("session_node"):
+        return                                   # 서브에이전트가 띄운 것은 메인 세션의 일이 아니다
     i = ev.get("tool_input") or {}
-    now = time.time()
-    wait = [w for w in st.get("agents_wait") or [] if now - w["ts"] < 120]   # 실제로 안 뜬 것은 버린다
-    wait.append({"type": i.get("subagent_type") or "general-purpose",
-                 "desc": i.get("description") or "", "prompt": i.get("prompt") or "", "ts": now})
-    st["agents_wait"] = wait
+    head = f"{datetime.now():%H:%M} \U0001f916 {i.get('subagent_type') or 'general-purpose'}: "
+    ask = scrub(i.get("prompt"), 1500)
+    nid = node(st["session_node"], head + label(i.get("description"), 100) + " · 진행 중",
+               note="지시: " + ask)
+    st.setdefault("agents", {})[ev.get("tool_use_id")] = {
+        "id": nid, "title": head + html_label(i.get("description"), 100), "ts": time.time(), "ask": ask}
     save(sid, st)
 
 
-def h_agent_start(ev, st, sid):
-    wait, typ = st.get("agents_wait") or [], ev.get("agent_type") or ""
-    j = next((j for j, w in enumerate(wait) if w["type"] == typ), 0 if wait else None)
-    if j is None or not st.get("session_node"):
-        return                                   # Agent 도구로 띄운 게 아닌 것(워크플로 등)은 기록하지 않는다
-    w = wait.pop(j)
-    head = f"{datetime.now():%H:%M} \U0001f916 {typ or w['type']}: "
-    ask = scrub(w["prompt"], 1500)
-    nid = node(st["session_node"], head + label(w["desc"], 100), note="지시: " + ask)
-    a = {"id": nid, "title": head + html_label(w["desc"], 100), "ts": time.time(), "ask": ask}
-    ended = (st.get("agents_ended") or {}).pop(ev.get("agent_id"), None)
-    if ended:                                    # Stop 훅이 먼저 처리된 아주 짧은 에이전트
-        finish_agent(a, ended["ts"], ended.get("result"))
-    else:
-        st.setdefault("agents", {})[ev.get("agent_id")] = a
-    save(sid, st)
-
-
-def finish_agent(a, until, result=None):
-    """소요 시간을 붙여 체크한다. 에이전트가 알아 온 내용은 노트 첫 줄에 둬서 접혀 있어도 보이게 한다."""
-    kw = {"name": f"{a['title']} <i>· {max(0, until - a['ts']) / 60:.0f}분</i>"}
-    if result:
-        kw["note"] = f"결과: {scrub(result, 6000)}\n\n지시: {a.get('ask', '')}"
+def finish_agent(a, until, status="completed", report=None):
+    """체크하고, 메인 세션의 응답을 노트 첫 줄에 보고로 남겨 접혀 있어도 보이게 한다."""
+    tail = (f"{max(0, until - a['ts']) / 60:.0f}분" if status == "completed"
+            else {"failed": "실패", "killed": "중단됨", "stopped": "중단됨"}.get(status, status))
+    kw = {"name": f"{a['title']} <i>· {tail}</i>"}
+    if report:
+        kw["note"] = f"결과: {scrub(report, 6000)}\n\n지시: {a.get('ask', '')}"
     edit(a["id"], **kw)
     done(a["id"])
-
-
-def h_agent_stop(ev, st, sid):
-    a = (st.get("agents") or {}).pop(ev.get("agent_id"), None)
-    result = ev.get("last_assistant_message")
-    if a:
-        finish_agent(a, time.time(), result)
-    else:                                        # 비동기 훅이라 SubagentStart 보다 먼저 올 수 있다
-        now = time.time()
-        ended = {k: v for k, v in (st.get("agents_ended") or {}).items()
-                 if isinstance(v, dict) and now - v["ts"] < 120}
-        ended[ev.get("agent_id")] = {"ts": now, "result": result}
-        st["agents_ended"] = ended
-    save(sid, st)
 
 
 def h_link(st, sid):
@@ -697,13 +687,13 @@ def main():
             st.setdefault("turns", []).append({
                 "id": st.pop("turn_node"), "label": st.pop("turn_label", "턴"),
                 "key": "", "ts": st.pop("turn_started", time.time())})
+        for k in ("agents_wait", "agents_ended"):  # 1.4~1.5 의 SubagentStart/Stop 방식이 남긴 것
+            st.pop(k, None)
         if   mode == "session-start": h_start(ev, st, sid)
         elif mode == "prompt":        h_prompt(ev, st, sid)
         elif mode == "stop":          h_stop(ev, st, sid)
         elif mode == "idle":          h_idle(ev, st, sid)
         elif mode == "agent-launch":  h_agent_launch(ev, st, sid)
-        elif mode == "agent-start":   h_agent_start(ev, st, sid)
-        elif mode == "agent-stop":    h_agent_stop(ev, st, sid)
         elif mode == "session-end":   h_end(ev, st, sid)
         elif mode == "note":          h_note(text, st, sid)
         elif mode == "close":         h_end({"reason": "manual"}, st, sid)
