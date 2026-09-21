@@ -189,12 +189,17 @@ def texts(content):
     return content if isinstance(content, str) else ""
 
 
-def since_stop(path, st):
-    """마지막 Stop 이후 transcript 를 읽어 (사용자 요청들, 마지막 응답) 을 돌려준다.
+def when(r):
+    try:    return datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00")).timestamp()
+    except Exception: return None
 
-    요청은 정규화된 텍스트 목록이다. 직접 입력한 요청은 type=user 의 텍스트로,
-    작업 중에 끼어든 대기열 요청은 queued_command 첨부로 남는다.
-    판단할 수 없으면 (None, None).
+
+def since_stop(path, st):
+    """마지막 Stop 이후 transcript 를 읽어 (사건 목록, 마지막 응답) 을 돌려준다.
+
+    사건은 (종류, 정규화된 텍스트, 시각) 이다. user 는 직접 입력한 요청(type=user 의
+    텍스트), 작업 중에 끼어든 대기열 요청(queued_command 첨부), 취소 표시 등이고,
+    assistant 는 Claude 가 응답을 시작했다는 표시다. 판단할 수 없으면 (None, None).
     """
     try:
         with open(path, "rb") as f:
@@ -204,7 +209,7 @@ def since_stop(path, st):
         return None, None
     end = data.rfind(b"\n") + 1                  # 쓰는 중인 마지막 줄은 다음 Stop 에서 읽는다
     st["offset"] = st.get("offset", 0) + end
-    got, reply = [], None
+    seq, reply = [], None
     for line in data[:end].splitlines():
         try:
             r = json.loads(line)
@@ -214,19 +219,54 @@ def since_stop(path, st):
             continue
         a = r.get("attachment") or {}
         if r.get("type") == "assistant":
+            seq.append(("assistant", "", when(r)))
             reply = texts((r.get("message") or {}).get("content")).strip() or reply
             continue
         if r.get("type") == "user":
             c = texts((r.get("message") or {}).get("content"))
         elif r.get("type") == "attachment" and a.get("type") == "queued_command":
-            c = a.get("prompt")
+            c = texts(a.get("prompt"))               # 이미지가 붙으면 블록 목록으로 온다
         else:
             continue
         if isinstance(c, str) and c.strip():
-            got.append(norm(c))
-    if not got:                                  # 턴마다 요청이 최소 하나는 있다. 없으면 형식이 바뀐 것
+            seq.append(("user", norm(c), when(r)))
+    if not any(k == "user" for k, _, _ in seq):  # 턴마다 요청이 최소 하나는 있다. 없으면 형식이 바뀐 것
         return None, None
-    return got, reply
+    return seq, reply
+
+
+INTERRUPT = "[Request interrupted by user"      # Esc 취소와 도구 거부("... for tool use") 둘 다
+
+
+def classify(turns, seq, final=False):
+    """열린 턴을 transcript 사건과 맞춰 (턴, 상태, 중단 시각) 목록을 돌려준다.
+
+    상태: None(아직 전달 안 됨) / "interrupted"(취소 표시가 있음) /
+    "cancelled"(응답이 시작되기 전에 다음 요청이 옴) / "ran"(처리됨).
+    각 요청의 구간은 다음 요청 직전까지다. final 이면 마지막 요청도 구간이 끝난 것으로 본다.
+    """
+    pos, start = [], 0
+    for t in turns:
+        i = next((i for i in range(start, len(seq))
+                  if seq[i][0] == "user" and t["key"] in seq[i][1]), None)
+        pos.append(i)
+        if i is not None:
+            start = i                            # 대기열 요청 여럿이 한 메시지로 전달될 수 있다
+    marks = sorted({p for p in pos if p is not None})
+    out = []
+    for t, p in zip(turns, pos):
+        if p is None:
+            out.append((t, None, None)); continue
+        upto = next((m for m in marks if m > p), len(seq))
+        seg = seq[p + 1:upto]
+        stop = next((e for e in seg if e[0] == "user" and e[1].startswith(INTERRUPT)), None)
+        if stop:
+            out.append((t, "interrupted", stop[2] or time.time()))
+        elif (upto < len(seq) or final) and not any(e[0] == "assistant" for e in seg):
+            out.append((t, "cancelled", None))
+        else:
+            out.append((t, "ran", None))
+    return out
 
 
 def headline(text):
@@ -260,51 +300,65 @@ def h_start(ev, st, sid):
               "기록 사실 자체는 사용자에게 보고하지 말 것.")
 
 
+def close(t, text, st, until=None):
+    """턴 노드를 닫는다. text 가 없으면 요청 앞부분을, until 이 있으면 소요 시간을 붙인다."""
+    name = f"{t['hm']} {text}" if text and t.get("hm") else t["label"]
+    if until:
+        name += f" <i>· {max(0, until - max(t['ts'], st.get('last_stop', 0))) / 60:.0f}분</i>"
+    edit(t["id"], name=name)
+    done(t["id"])
+    t["closed"] = True                           # 다음 Stop 까지 구간 경계로 남겨 둔다
+
+
 def h_prompt(ev, st, sid):
     if not st.get("session_node"):
         return
+    turns = st.setdefault("turns", [])
+    if any(not t.get("closed") for t in turns):
+        # 취소(Esc)나 도구 거부로 끝난 턴에는 Stop 이 오지 않으므로 다음 요청이 올 때 닫는다.
+        # offset 은 Stop 만 옮긴다. 여기서는 복사본으로 읽기만 한다.
+        seq, _ = since_stop(ev.get("transcript_path"), dict(st))
+        for t, state, cut in classify(turns, seq or []):
+            if state == "interrupted" and not t.get("closed"):
+                close(t, "중단됨", st, cut)
     # 작업 중에 대기열에 넣은 요청도 이 훅은 넣는 순간 한 번만 불린다(꺼낼 때는 안 불린다).
     # 그래서 열린 턴을 덮어쓰지 않고 목록에 쌓아 두고, 완료는 Stop 에서 전달 여부로 판단한다.
     # 요청 전문은 노트에 있으므로 제목은 시각만 두고, 턴이 끝나면 응답의 첫 문장으로 채운다.
+    p = norm(ev.get("prompt"))
     hm = f"{datetime.now():%H:%M}"
     nid = node(st["session_node"], hm, note=scrub(ev.get("prompt"), 2000), layout="todo")
-    st.setdefault("turns", []).append({
+    turns.append({
         "id": nid, "hm": hm, "label": f"{hm} " + html_label(ev.get("prompt"), 110),
-        "key": norm(ev.get("prompt"))[:40], "ts": time.time()})
+        # 슬래시 명령은 transcript 에 이름과 인자가 따로 남으므로 이름만 맞춘다
+        "key": p.split(" ")[0] if p.startswith("/") else p[:40], "ts": time.time()})
     save(sid, st)
-
-
-INTERRUPT = "[Request interrupted by user"
 
 
 def h_stop(ev, st, sid):
     turns = st.get("turns") or []
     if not turns:
         return
-    got, reply = since_stop(ev.get("transcript_path"), st)
-    # 이번 턴에 전달되지 않은 요청은 대기열에 남아 다음 턴이 된다.
+    seq, reply = since_stop(ev.get("transcript_path"), st)
     # transcript 를 읽을 수 없으면 전부 닫는다 (미완료로 남는 것보다 낫다).
-    closing, left = [], []
-    for t in turns:
-        at = 0 if got is None else next((i for i, g in enumerate(got) if t["key"] in g), None)
-        (left if at is None else closing).append((at, t))
-    closing.sort(key=lambda x: x[0])
-    now, titled = time.time(), False
-    for n, (at, t) in enumerate(closing):
-        upto = closing[n + 1][0] if n + 1 < len(closing) else len(got or [])
-        if got and any(g.startswith(INTERRUPT) for g in got[at + 1:upto]):
-            text = "중단됨"
-        elif titled:
-            text = "↳ 앞 요청과 함께 처리"
+    rows = classify(turns, seq) if seq else [(t, "ran", None) for t in turns]
+    now, titled, left = time.time(), False, []
+    for t, state, cut in rows:
+        if t.get("closed"):
+            continue
+        if state is None:
+            # 아직 전달 안 된 대기열 요청은 다음 턴이 된다. 두 번째 Stop 까지 못 맞추면 닫는다.
+            t["waits"] = t.get("waits", 0) + 1
+            if t["waits"] < 2:
+                left.append(t); continue
+            close(t, None, st)
+        elif state == "interrupted": close(t, "중단됨", st, cut)
+        elif state == "cancelled":   close(t, "취소됨", st)
+        elif titled:                 close(t, "↳ 앞 요청과 함께 처리", st, now)
         elif reply:
-            text, titled = html_label(headline(reply), 100), True
+            close(t, html_label(headline(reply), 100), st, now); titled = True
         else:
-            text = None                          # 응답을 못 찾으면 요청 앞부분을 쓴다
-        name = f"{t['hm']} {text}" if text and t.get("hm") else t["label"]
-        mins = (now - max(t["ts"], st.get("last_stop", 0))) / 60
-        edit(t["id"], name=f"{name} <i>· {mins:.0f}분</i>")
-        done(t["id"])
-    st.update(turns=[t for _, t in left], last_stop=now)
+            close(t, None, st, now)              # 응답을 못 찾으면 요청 앞부분을 쓴다
+    st.update(turns=left, last_stop=now)
     save(sid, st)
 
 
@@ -312,9 +366,18 @@ def h_end(ev, st, sid):
     nid = st.get("session_node")
     if not nid:
         return
-    for t in st.get("turns") or []:
-        try: done(t["id"])
-        except Exception: pass
+    turns = st.get("turns") or []
+    if any(not t.get("closed") for t in turns):
+        seq, _ = since_stop(ev.get("transcript_path"), st)
+        rows = classify(turns, seq, final=True) if seq else [(t, "ran", None) for t in turns]
+        # 처리 중이던 턴(Stop 없이 세션이 끝남)도 중단된 것으로 본다
+        text = {None: "처리되지 않음", "interrupted": "중단됨", "cancelled": "취소됨", "ran": "중단됨"}
+        now = time.time()
+        for t, state, cut in rows:
+            if t.get("closed"):
+                continue
+            try: close(t, text[state], st, cut or (now if state == "ran" else None))
+            except Exception: pass
     mins = (time.time() - st.get("started", time.time())) / 60
     node(nid, f"⏹ 종료 · {ev.get('reason','?')} · {mins:.0f}분")
     done(nid)
@@ -322,7 +385,8 @@ def h_end(ev, st, sid):
 
 
 def h_note(text, st, sid):
-    parent = ((st.get("turns") or [{}])[-1].get("id")) or st.get("session_node")
+    parent = next((t["id"] for t in reversed(st.get("turns") or []) if not t.get("closed")),
+                  st.get("session_node"))
     if not parent:
         return
     node(parent, "▸ " + label(text, 300),
