@@ -161,15 +161,18 @@ def call(method, path, body=None, tries=3):
             raise
 
 
-def node(parent, name, note=None, layout=None, pos="bottom"):
+# 턴·에이전트·세션 노드는 todo 로 만들지 않고 완료 처리도 하지 않는다. 완료된 항목은 취소선에
+# 흐려져 읽기 나쁘고, 언제 완료할지 정확히 알 신호(취소 훅 등)도 없다. 상태는 제목으로만 나타낸다:
+# 진행 중은 시각만(턴) 또는 "· 진행 중"(에이전트), 끝나면 요약과 소요 시간, 안 끝나면 취소됨/중단됨.
+
+
+def node(parent, name, note=None, pos="bottom"):
     b = {"parent_id": parent, "name": name, "position": pos}
     if note:   b["note"] = note[:8000]
-    if layout: b["layoutMode"] = layout
     return call("POST", "/nodes", b)["item_id"]
 
 
 def edit(nid, **kw): call("POST", f"/nodes/{nid}", kw)
-def done(nid):       call("POST", f"/nodes/{nid}/complete")
 def short(nid):      return nid.split("-")[-1]
 
 def spath(sid): return STATE / "state" / f"{sid}.json"
@@ -334,12 +337,11 @@ def h_start(ev, st, sid):
 
 
 def close(t, text, st, until=None):
-    """턴 노드를 닫는다. text 가 없으면 요청 앞부분을, until 이 있으면 소요 시간을 붙인다."""
+    """턴의 제목을 확정한다. text 가 없으면 요청 앞부분을, until 이 있으면 소요 시간을 붙인다."""
     name = f"{t['hm']} {text}" if text and t.get("hm") else t["label"]
     if until:
         name += f" <i>· {max(0, until - max(t['ts'], st.get('last_stop', 0))) / 60:.0f}분</i>"
     edit(t["id"], name=name)
-    done(t["id"])
     t["closed"] = True                           # 다음 Stop 까지 구간 경계로 남겨 둔다
 
 
@@ -355,11 +357,11 @@ def h_prompt(ev, st, sid):
             if state == "interrupted" and not t.get("closed"):
                 close(t, "중단됨", st, cut)
     # 작업 중에 대기열에 넣은 요청도 이 훅은 넣는 순간 한 번만 불린다(꺼낼 때는 안 불린다).
-    # 그래서 열린 턴을 덮어쓰지 않고 목록에 쌓아 두고, 완료는 Stop 에서 전달 여부로 판단한다.
+    # 그래서 열린 턴을 덮어쓰지 않고 목록에 쌓아 두고, 제목은 Stop 에서 전달 여부로 판단해 확정한다.
     # 요청 전문은 노트에 있으므로 제목은 시각만 두고, 턴이 끝나면 응답의 첫 문장으로 채운다.
     p = norm(ev.get("prompt"))
     hm = f"{datetime.now():%H:%M}"
-    nid = node(st["session_node"], hm, note=scrub(ev.get("prompt"), 2000), layout="todo")
+    nid = node(st["session_node"], hm, note=scrub(ev.get("prompt"), 2000))
     turns.append({
         "id": nid, "hm": hm, "label": f"{hm} " + html_label(ev.get("prompt"), 110),
         # 슬래시 명령은 transcript 에 이름과 인자가 따로 남으므로 이름만 맞춘다
@@ -382,14 +384,14 @@ def h_stop(ev, st, sid):
         st["last_stop"] = now
         save(sid, st)
         return
-    # transcript 를 읽을 수 없으면 전부 닫는다 (미완료로 남는 것보다 낫다).
+    # transcript 를 읽을 수 없으면 전부 처리된 것으로 본다.
     rows = classify(turns, seq) if seq else [(t, "ran", None) for t in turns]
     titled, left = False, []
     for t, state, cut in rows:
         if t.get("closed"):
             continue
         if state is None:
-            # 아직 전달 안 된 대기열 요청은 다음 턴이 된다. 두 번째 Stop 까지 못 맞추면 닫는다.
+            # 아직 전달 안 된 대기열 요청은 다음 턴이 된다. 두 번째 Stop 까지 못 맞추면 요청 앞부분으로 확정한다.
             t["waits"] = t.get("waits", 0) + 1
             if t["waits"] < 2:
                 left.append(t); continue
@@ -406,10 +408,10 @@ def h_stop(ev, st, sid):
 
 
 def h_idle(ev, st, sid):
-    """입력 대기 알림(idle_prompt): Claude 가 쉬고 있으니 Stop 없이 끝난 턴은 모두 끝난 것이다.
+    """입력 대기 알림(idle_prompt): Claude 가 쉬고 있으니 Stop 없이 끝난 턴은 취소·중단된 것이다.
 
     취소(Esc)에는 훅이 없어서, 사용자가 다음 요청을 보내기 전에는 이 알림
-    (입력 없이 약 60초)이 가장 이른 신호다.
+    (입력 없이 약 60초)이 그렇게 표시할 수 있는 가장 이른 신호다.
     """
     turns = st.get("turns") or []
     if not any(not t.get("closed") for t in turns):
@@ -426,8 +428,9 @@ def h_end(ev, st, sid):
     nid = st.get("session_node")
     if not nid:
         return
-    for a in (st.get("agents") or {}).values():
-        try: done(a["id"])
+    now = time.time()
+    for a in (st.get("agents") or {}).values():   # 아직 일하던 에이전트는 세션과 함께 끝난다
+        try: finish_agent(a, now, "stopped")
         except Exception: pass
     turns = st.get("turns") or []
     if any(not t.get("closed") for t in turns):
@@ -435,15 +438,13 @@ def h_end(ev, st, sid):
         rows = classify(turns, seq, final=True) if seq else [(t, "ran", None) for t in turns]
         # 처리 중이던 턴(Stop 없이 세션이 끝남)도 중단된 것으로 본다
         text = {None: "처리되지 않음", "interrupted": "중단됨", "cancelled": "취소됨", "ran": "중단됨"}
-        now = time.time()
         for t, state, cut in rows:
             if t.get("closed"):
                 continue
             try: close(t, text[state], st, cut or (now if state == "ran" else None))
             except Exception: pass
-    mins = (time.time() - st.get("started", time.time())) / 60
+    mins = (now - st.get("started", now)) / 60
     node(nid, f"⏹ 종료 · {ev.get('reason','?')} · {mins:.0f}분")
-    done(nid)
     spath(sid).unlink(missing_ok=True)
 
 
@@ -463,7 +464,7 @@ def h_note(text, st, sid):
 
 # 서브에이전트: 일은 서브에이전트가 하고 기록은 메인 세션이 한다.
 # 메인 세션이 에이전트에게 맡기는 순간(PreToolUse) "진행 중" 항목을 만들고, 결과를 받아 응답한
-# Stop 에서 그 응답을 보고로 남기고 체크한다. 둘은 tool_use_id 로 잇는다. 에이전트는 턴이 끝난
+# Stop 에서 그 응답을 보고로 남기고 제목을 확정한다. 둘은 tool_use_id 로 잇는다. 에이전트는 턴이 끝난
 # 뒤에도 일할 수 있고 턴 노드는 접혀 보이므로, 세션 바로 아래(턴과 같은 단계)에 둔다.
 
 
@@ -481,14 +482,13 @@ def h_agent_launch(ev, st, sid):
 
 
 def finish_agent(a, until, status="completed", report=None):
-    """체크하고, 메인 세션의 응답을 노트 첫 줄에 보고로 남겨 접혀 있어도 보이게 한다."""
+    """'진행 중' 을 결과로 바꾸고, 메인 세션의 응답을 노트 첫 줄에 보고로 남겨 접혀 있어도 보이게 한다."""
     tail = (f"{max(0, until - a['ts']) / 60:.0f}분" if status == "completed"
             else {"failed": "실패", "killed": "중단됨", "stopped": "중단됨"}.get(status, status))
     kw = {"name": f"{a['title']} <i>· {tail}</i>"}
     if report:
         kw["note"] = f"결과: {scrub(report, 6000)}\n\n지시: {a.get('ask', '')}"
     edit(a["id"], **kw)
-    done(a["id"])
 
 
 def h_link(st, sid):
