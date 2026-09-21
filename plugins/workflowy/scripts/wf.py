@@ -182,21 +182,29 @@ def save(sid, st):
 def norm(s): return " ".join(str(s or "").split())
 
 
-def delivered(path, st):
-    """마지막 Stop 이후 transcript 에 실제로 전달된 사용자 요청들 (정규화된 텍스트).
+def texts(content):
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text")
+    return content if isinstance(content, str) else ""
 
-    직접 입력한 요청은 type=user 의 텍스트로, 작업 중에 끼어든 대기열 요청은
-    queued_command 첨부로 남는다. 판단할 수 없으면 None.
+
+def since_stop(path, st):
+    """마지막 Stop 이후 transcript 를 읽어 (사용자 요청들, 마지막 응답) 을 돌려준다.
+
+    요청은 정규화된 텍스트 목록이다. 직접 입력한 요청은 type=user 의 텍스트로,
+    작업 중에 끼어든 대기열 요청은 queued_command 첨부로 남는다.
+    판단할 수 없으면 (None, None).
     """
     try:
         with open(path, "rb") as f:
             f.seek(st.get("offset", 0))
             data = f.read()
     except Exception:
-        return None
+        return None, None
     end = data.rfind(b"\n") + 1                  # 쓰는 중인 마지막 줄은 다음 Stop 에서 읽는다
     st["offset"] = st.get("offset", 0) + end
-    out = []
+    got, reply = [], None
     for line in data[:end].splitlines():
         try:
             r = json.loads(line)
@@ -205,18 +213,29 @@ def delivered(path, st):
         if r.get("isSidechain"):
             continue
         a = r.get("attachment") or {}
+        if r.get("type") == "assistant":
+            reply = texts((r.get("message") or {}).get("content")).strip() or reply
+            continue
         if r.get("type") == "user":
-            c = (r.get("message") or {}).get("content")
-            if isinstance(c, list):
-                c = " ".join(b.get("text", "") for b in c
-                             if isinstance(b, dict) and b.get("type") == "text")
+            c = texts((r.get("message") or {}).get("content"))
         elif r.get("type") == "attachment" and a.get("type") == "queued_command":
             c = a.get("prompt")
         else:
             continue
         if isinstance(c, str) and c.strip():
-            out.append(norm(c))
-    return out or None                           # 턴마다 요청이 최소 하나는 있다. 없으면 형식이 바뀐 것
+            got.append(norm(c))
+    if not got:                                  # 턴마다 요청이 최소 하나는 있다. 없으면 형식이 바뀐 것
+        return None, None
+    return got, reply
+
+
+def headline(text):
+    """응답의 첫 문장. 응답은 결론부터 쓰므로 그 턴의 작업과 결과를 요약한다."""
+    para = text.strip().split("\n\n")[0]
+    para = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", para)       # [x](url) -> x
+    para = re.sub(r"^\s*(?:[-*+]|\d+\.)\s+", "", para)          # 목록 기호
+    para = norm(re.sub(r"[*`#>|]", "", para))                    # 마크다운 기호
+    return re.split(r"(?<=[.!?])\s", para, maxsplit=1)[0]
 
 # ----------------------------------------------------------------- 훅
 
@@ -246,30 +265,46 @@ def h_prompt(ev, st, sid):
         return
     # 작업 중에 대기열에 넣은 요청도 이 훅은 넣는 순간 한 번만 불린다(꺼낼 때는 안 불린다).
     # 그래서 열린 턴을 덮어쓰지 않고 목록에 쌓아 두고, 완료는 Stop 에서 전달 여부로 판단한다.
-    ts = f"{datetime.now():%H:%M} "
-    nid = node(st["session_node"], ts + label(ev.get("prompt"), 110),
-               note=scrub(ev.get("prompt"), 2000), layout="todo")
+    # 요청 전문은 노트에 있으므로 제목은 시각만 두고, 턴이 끝나면 응답의 첫 문장으로 채운다.
+    hm = f"{datetime.now():%H:%M}"
+    nid = node(st["session_node"], hm, note=scrub(ev.get("prompt"), 2000), layout="todo")
     st.setdefault("turns", []).append({
-        "id": nid, "label": ts + html_label(ev.get("prompt"), 110),
+        "id": nid, "hm": hm, "label": f"{hm} " + html_label(ev.get("prompt"), 110),
         "key": norm(ev.get("prompt"))[:40], "ts": time.time()})
     save(sid, st)
+
+
+INTERRUPT = "[Request interrupted by user"
 
 
 def h_stop(ev, st, sid):
     turns = st.get("turns") or []
     if not turns:
         return
-    got = delivered(ev.get("transcript_path"), st)
-    now, left = time.time(), []
+    got, reply = since_stop(ev.get("transcript_path"), st)
+    # 이번 턴에 전달되지 않은 요청은 대기열에 남아 다음 턴이 된다.
+    # transcript 를 읽을 수 없으면 전부 닫는다 (미완료로 남는 것보다 낫다).
+    closing, left = [], []
     for t in turns:
-        # 이번 턴에 전달되지 않은 요청은 대기열에 남아 다음 턴이 된다.
-        # transcript 를 읽을 수 없으면 전부 닫는다 (미완료로 남는 것보다 낫다).
-        if got is not None and not any(t["key"] in g for g in got):
-            left.append(t); continue
+        at = 0 if got is None else next((i for i, g in enumerate(got) if t["key"] in g), None)
+        (left if at is None else closing).append((at, t))
+    closing.sort(key=lambda x: x[0])
+    now, titled = time.time(), False
+    for n, (at, t) in enumerate(closing):
+        upto = closing[n + 1][0] if n + 1 < len(closing) else len(got or [])
+        if got and any(g.startswith(INTERRUPT) for g in got[at + 1:upto]):
+            text = "중단됨"
+        elif titled:
+            text = "↳ 앞 요청과 함께 처리"
+        elif reply:
+            text, titled = html_label(headline(reply), 100), True
+        else:
+            text = None                          # 응답을 못 찾으면 요청 앞부분을 쓴다
+        name = f"{t['hm']} {text}" if text and t.get("hm") else t["label"]
         mins = (now - max(t["ts"], st.get("last_stop", 0))) / 60
-        edit(t["id"], name=f"{t['label']} <i>· {mins:.0f}분</i>")
+        edit(t["id"], name=f"{name} <i>· {mins:.0f}분</i>")
         done(t["id"])
-    st.update(turns=left, last_stop=now)
+    st.update(turns=[t for _, t in left], last_stop=now)
     save(sid, st)
 
 
