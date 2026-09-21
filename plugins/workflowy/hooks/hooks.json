@@ -9,11 +9,6 @@
       { "hooks": [{ "type": "command", "timeout": 10,
                     "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" prompt" }] }
     ],
-    "PostToolUse": [
-      { "matcher": "Edit|Write|NotebookEdit|Bash|Task|WebFetch|WebSearch|TodoWrite",
-        "hooks": [{ "type": "command", "timeout": 15, "async": true,
-                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" tool" }] }
-    ],
     "Stop": [
       { "hooks": [{ "type": "command", "timeout": 10,
                     "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" stop" }] }

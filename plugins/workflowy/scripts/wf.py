@@ -38,9 +38,6 @@ HOOKS = {
         {"type": "command", "timeout": 15, "command": f"{CMD} session-start"}]}],
     "UserPromptSubmit": [{"hooks": [
         {"type": "command", "timeout": 10, "command": f"{CMD} prompt"}]}],
-    "PostToolUse": [{"matcher": "Edit|Write|NotebookEdit|Bash|Task|WebFetch|WebSearch|TodoWrite",
-                     "hooks": [
-        {"type": "command", "timeout": 15, "async": True, "command": f"{CMD} tool"}]}],
     "Stop": [{"hooks": [
         {"type": "command", "timeout": 10, "command": f"{CMD} stop"}]}],
     "SessionEnd": [{"hooks": [
@@ -55,8 +52,8 @@ argument-hint: [note <텍스트> | link | close]
 
 # Workflowy 작업 로그
 
-도구 호출과 파일 변경은 훅이 자동으로 기록한다.
-이 스킬은 훅이 알 수 없는 **의미 단위 정보**만 기록한다.
+사용자 요청은 훅이 턴 단위로 자동 기록한다.
+이 스킬은 훅이 알 수 없는 **의미 단위 정보**를 기록한다.
 
 현재 세션 ID는 `${CLAUDE_SESSION_ID}` 이다.
 
@@ -85,7 +82,7 @@ python3 ~/.claude/hooks/wf.py close "${CLAUDE_SESSION_ID}"
 **기록한다**: 착수 전 계획 / 방향을 바꾼 이유 / 예상 밖의 발견 /
 막힌 지점과 그 원인 / 사용자가 내린 결정.
 
-**기록하지 않는다**: 파일을 읽었다·명령을 실행했다 같은 사실(훅이 이미 적는다) /
+**기록하지 않는다**: 파일을 읽었다·명령을 실행했다 같은 단순 사실 /
 한 줄짜리 진행 중계 / 최종 요약(대화에 이미 있다).
 
 메모 하나는 한 문장. 길어지면 여러 개로 나눈다.
@@ -96,7 +93,7 @@ MEMO = f"""
 {MARK}
 ## Workflowy 작업 로그
 
-이 세션의 작업은 Workflowy에 자동 기록된다. 다음 시점에 `session-log` 스킬로 메모를 남겨라:
+이 세션의 사용자 요청은 Workflowy에 턴 단위로 자동 기록된다. 다음 시점에 `session-log` 스킬로 메모를 남겨라:
 
 - 여러 단계 작업을 시작하기 직전 - 계획 한 줄
 - 접근 방식을 바꿨을 때 - 바꾼 이유
@@ -184,29 +181,19 @@ def save(sid, st):
 # ----------------------------------------------------------------- 훅
 
 
-def turn_note(st):
-    out = [st.get("prompt", "")]
-    if st.get("todos"):
-        out.append("\n--- 할 일 ---")
-        for t in st["todos"]:
-            m = {"completed": "[x]", "in_progress": "[~]"}.get(t.get("status"), "[ ]")
-            out.append(f"{m} {scrub(t.get('content'), 120)}")
-    return "\n".join(out)
-
-
 def h_start(ev, st, sid):
     root = conf("WORKFLOWY_ROOT_ID", "root_id")
     proj = pathlib.Path(ev.get("cwd") or ".").name
     why  = ev.get("session_start_reason") or ev.get("source") or "?"
     nid  = node(root, f"## {proj} · {datetime.now():%Y-%m-%d %H:%M}",
                 note=f"cwd: {ev.get('cwd')}\nsession: {sid}\nstart: {why}")
-    st.update(session_node=nid, started=time.time(), tools=0)
+    st.update(session_node=nid, started=time.time())
     save(sid, st)
     print(f"[workflowy] 이 세션의 작업 로그: https://workflowy.com/#/{short(nid)}")
     if PLUGIN:
         # 플러그인은 사용자의 CLAUDE.md 를 건드릴 수 없다.
         # SessionStart 의 stdout 은 Claude 에게 전달되므로 여기서 상시 지시를 준다.
-        print("도구 호출과 파일 변경은 자동 기록된다. 다음 시점에는 /workflowy:session-log 스킬로 "
+        print("사용자 요청은 턴 단위로 자동 기록된다. 다음 시점에는 /workflowy:session-log 스킬로 "
               "한 문장 메모를 남겨라: 여러 단계 작업 착수 직전(계획), 접근 방식을 "
               "바꿨을 때(이유), 막혔을 때(무엇에 왜), 사용자가 방향을 정했을 때(결정). "
               "기록 사실 자체는 사용자에게 보고하지 말 것.")
@@ -215,40 +202,11 @@ def h_start(ev, st, sid):
 def h_prompt(ev, st, sid):
     if not st.get("session_node"):
         return
-    st["prompt"] = scrub(ev.get("prompt"), 2000)
     ts = f"{datetime.now():%H:%M} "
     nid = node(st["session_node"], ts + label(ev.get("prompt"), 110),
-               note=st["prompt"], layout="todo")
+               note=scrub(ev.get("prompt"), 2000), layout="todo")
     st.update(turn_node=nid, turn_label=ts + html_label(ev.get("prompt"), 110),
-              turn_started=time.time(), turn_tools=0, todos=[])
-    save(sid, st)
-
-
-def h_tool(ev, st, sid):
-    parent = st.get("turn_node") or st.get("session_node")
-    if not parent:
-        return
-    t = ev.get("tool_name", "")
-    i = ev.get("tool_input") or {}
-    if t == "TodoWrite":
-        st["todos"] = i.get("todos") or []
-        save(sid, st)
-        if st.get("turn_node"):
-            edit(st["turn_node"], note=turn_note(st))
-        return
-    if t == "Bash":
-        nm, nt = "$ " + label(i.get("command"), 100), scrub(i.get("command"), 2000)
-    elif t in ("Edit", "Write", "NotebookEdit"):
-        nm, nt = "✏️ " + label(i.get("file_path"), 150), None
-    elif t == "Task":
-        nm, nt = "\U0001f916 " + label(i.get("description"), 100), scrub(i.get("prompt"), 2000)
-    elif t in ("WebFetch", "WebSearch"):
-        nm, nt = "\U0001f310 " + label(i.get("url") or i.get("query"), 120), None
-    else:
-        nm, nt = "· " + t, None
-    node(parent, nm, note=nt)
-    st["turn_tools"] = st.get("turn_tools", 0) + 1
-    st["tools"] = st.get("tools", 0) + 1
+              turn_started=time.time())
     save(sid, st)
 
 
@@ -257,8 +215,7 @@ def h_stop(ev, st, sid):
     if not nid:
         return
     mins = (time.time() - st.get("turn_started", time.time())) / 60
-    edit(nid, name=f"{st.get('turn_label','턴')} <i>· {mins:.0f}분 · "
-                   f"{st.get('turn_tools',0)}회</i>")
+    edit(nid, name=f"{st.get('turn_label','턴')} <i>· {mins:.0f}분</i>")
     done(nid)
     st.pop("turn_node", None)
     save(sid, st)
@@ -272,8 +229,7 @@ def h_end(ev, st, sid):
         try: done(st["turn_node"])
         except Exception: pass
     mins = (time.time() - st.get("started", time.time())) / 60
-    node(nid, f"⏹ 종료 · {ev.get('reason','?')} · {mins:.0f}분 · "
-              f"도구 {st.get('tools',0)}회")
+    node(nid, f"⏹ 종료 · {ev.get('reason','?')} · {mins:.0f}분")
     done(nid)
     spath(sid).unlink(missing_ok=True)
 
@@ -308,10 +264,10 @@ def _write_settings(remove=False):
             return False
         shutil.copy(p, p.with_suffix(".json.bak"))
     hooks = cur.get("hooks", {})
-    for ev in list(HOOKS):                       # 재설치 대비: 기존 wf 블록 먼저 제거
+    for ev in set(hooks) | set(HOOKS):           # 재설치 대비: 기존 wf 블록 먼저 제거 (폐지된 이벤트 포함)
         kept = [b for b in hooks.get(ev, []) if not _ours(b)]
         if not remove:
-            kept += HOOKS[ev]
+            kept += HOOKS.get(ev, [])
         if kept: hooks[ev] = kept
         elif ev in hooks: del hooks[ev]
     if hooks: cur["hooks"] = hooks
@@ -479,7 +435,6 @@ def main():
     try:
         if   mode == "session-start": h_start(ev, st, sid)
         elif mode == "prompt":        h_prompt(ev, st, sid)
-        elif mode == "tool":          h_tool(ev, st, sid)
         elif mode == "stop":          h_stop(ev, st, sid)
         elif mode == "session-end":   h_end(ev, st, sid)
         elif mode == "note":          h_note(text, st, sid)
