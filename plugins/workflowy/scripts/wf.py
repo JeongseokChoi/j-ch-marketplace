@@ -178,6 +178,46 @@ def save(sid, st):
     p = spath(sid); p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(st), encoding="utf-8")
 
+
+def norm(s): return " ".join(str(s or "").split())
+
+
+def delivered(path, st):
+    """마지막 Stop 이후 transcript 에 실제로 전달된 사용자 요청들 (정규화된 텍스트).
+
+    직접 입력한 요청은 type=user 의 텍스트로, 작업 중에 끼어든 대기열 요청은
+    queued_command 첨부로 남는다. 판단할 수 없으면 None.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(st.get("offset", 0))
+            data = f.read()
+    except Exception:
+        return None
+    end = data.rfind(b"\n") + 1                  # 쓰는 중인 마지막 줄은 다음 Stop 에서 읽는다
+    st["offset"] = st.get("offset", 0) + end
+    out = []
+    for line in data[:end].splitlines():
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("isSidechain"):
+            continue
+        a = r.get("attachment") or {}
+        if r.get("type") == "user":
+            c = (r.get("message") or {}).get("content")
+            if isinstance(c, list):
+                c = " ".join(b.get("text", "") for b in c
+                             if isinstance(b, dict) and b.get("type") == "text")
+        elif r.get("type") == "attachment" and a.get("type") == "queued_command":
+            c = a.get("prompt")
+        else:
+            continue
+        if isinstance(c, str) and c.strip():
+            out.append(norm(c))
+    return out or None                           # 턴마다 요청이 최소 하나는 있다. 없으면 형식이 바뀐 것
+
 # ----------------------------------------------------------------- 훅
 
 
@@ -187,7 +227,9 @@ def h_start(ev, st, sid):
     why  = ev.get("session_start_reason") or ev.get("source") or "?"
     nid  = node(root, f"## {proj} · {datetime.now():%Y-%m-%d %H:%M}",
                 note=f"cwd: {ev.get('cwd')}\nsession: {sid}\nstart: {why}")
-    st.update(session_node=nid, started=time.time())
+    tp = ev.get("transcript_path")                # resume 이면 이전 대화는 건너뛴다
+    st.update(session_node=nid, started=time.time(),
+              offset=os.path.getsize(tp) if tp and os.path.exists(tp) else 0)
     save(sid, st)
     print(f"[workflowy] 이 세션의 작업 로그: https://workflowy.com/#/{short(nid)}")
     if PLUGIN:
@@ -202,22 +244,32 @@ def h_start(ev, st, sid):
 def h_prompt(ev, st, sid):
     if not st.get("session_node"):
         return
+    # 작업 중에 대기열에 넣은 요청도 이 훅은 넣는 순간 한 번만 불린다(꺼낼 때는 안 불린다).
+    # 그래서 열린 턴을 덮어쓰지 않고 목록에 쌓아 두고, 완료는 Stop 에서 전달 여부로 판단한다.
     ts = f"{datetime.now():%H:%M} "
     nid = node(st["session_node"], ts + label(ev.get("prompt"), 110),
                note=scrub(ev.get("prompt"), 2000), layout="todo")
-    st.update(turn_node=nid, turn_label=ts + html_label(ev.get("prompt"), 110),
-              turn_started=time.time())
+    st.setdefault("turns", []).append({
+        "id": nid, "label": ts + html_label(ev.get("prompt"), 110),
+        "key": norm(ev.get("prompt"))[:40], "ts": time.time()})
     save(sid, st)
 
 
 def h_stop(ev, st, sid):
-    nid = st.get("turn_node")
-    if not nid:
+    turns = st.get("turns") or []
+    if not turns:
         return
-    mins = (time.time() - st.get("turn_started", time.time())) / 60
-    edit(nid, name=f"{st.get('turn_label','턴')} <i>· {mins:.0f}분</i>")
-    done(nid)
-    st.pop("turn_node", None)
+    got = delivered(ev.get("transcript_path"), st)
+    now, left = time.time(), []
+    for t in turns:
+        # 이번 턴에 전달되지 않은 요청은 대기열에 남아 다음 턴이 된다.
+        # transcript 를 읽을 수 없으면 전부 닫는다 (미완료로 남는 것보다 낫다).
+        if got is not None and not any(t["key"] in g for g in got):
+            left.append(t); continue
+        mins = (now - max(t["ts"], st.get("last_stop", 0))) / 60
+        edit(t["id"], name=f"{t['label']} <i>· {mins:.0f}분</i>")
+        done(t["id"])
+    st.update(turns=left, last_stop=now)
     save(sid, st)
 
 
@@ -225,8 +277,8 @@ def h_end(ev, st, sid):
     nid = st.get("session_node")
     if not nid:
         return
-    if st.get("turn_node"):
-        try: done(st["turn_node"])
+    for t in st.get("turns") or []:
+        try: done(t["id"])
         except Exception: pass
     mins = (time.time() - st.get("started", time.time())) / 60
     node(nid, f"⏹ 종료 · {ev.get('reason','?')} · {mins:.0f}분")
@@ -235,7 +287,7 @@ def h_end(ev, st, sid):
 
 
 def h_note(text, st, sid):
-    parent = st.get("turn_node") or st.get("session_node")
+    parent = ((st.get("turns") or [{}])[-1].get("id")) or st.get("session_node")
     if not parent:
         return
     node(parent, "▸ " + label(text, 300),
@@ -432,6 +484,10 @@ def main():
         sid = ev.get("session_id", "")
 
     st = load(sid)
+    if "turn_node" in st:                        # 1.0.x 상태 파일: 열린 턴을 새 형식으로 옮긴다
+        st.setdefault("turns", []).append({
+            "id": st.pop("turn_node"), "label": st.pop("turn_label", "턴"),
+            "key": "", "ts": st.pop("turn_started", time.time())})
     try:
         if   mode == "session-start": h_start(ev, st, sid)
         elif mode == "prompt":        h_prompt(ev, st, sid)

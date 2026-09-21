@@ -47,6 +47,8 @@ claude plugin install workflowy@j-ch-marketplace \
 ```
 
 Workflowy에서 root node를 열어두면, **체크 안 된 맨 아래 항목이 "지금 하는 일"** 이다.
+작업 중에 대기열에 넣은 요청도 바로 턴으로 추가되고, 그 요청이 실제로 처리된 턴이 끝날 때
+체크된다.
 
 턴 아래의 `▸` 메모는 `session-log` 스킬로 남긴 것이다. 도구 호출(실행한 명령, 수정한
 파일 등)은 기록하지 않는다.
