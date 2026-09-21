@@ -13,6 +13,24 @@
       { "hooks": [{ "type": "command", "timeout": 10,
                     "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" stop" }] }
     ],
+    "Notification": [
+      { "matcher": "idle_prompt",
+        "hooks": [{ "type": "command", "timeout": 15, "async": true,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" idle" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Agent|Task",
+        "hooks": [{ "type": "command", "timeout": 10,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" agent-launch" }] }
+    ],
+    "SubagentStart": [
+      { "hooks": [{ "type": "command", "timeout": 15, "async": true,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" agent-start" }] }
+    ],
+    "SubagentStop": [
+      { "hooks": [{ "type": "command", "timeout": 15, "async": true,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" agent-stop" }] }
+    ],
     "SessionEnd": [
       { "hooks": [{ "type": "command", "timeout": 10,
                     "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" session-end" }] }

@@ -40,6 +40,14 @@ HOOKS = {
         {"type": "command", "timeout": 10, "command": f"{CMD} prompt"}]}],
     "Stop": [{"hooks": [
         {"type": "command", "timeout": 10, "command": f"{CMD} stop"}]}],
+    "Notification": [{"matcher": "idle_prompt", "hooks": [
+        {"type": "command", "timeout": 15, "async": True, "command": f"{CMD} idle"}]}],
+    "PreToolUse": [{"matcher": "Agent|Task", "hooks": [
+        {"type": "command", "timeout": 10, "command": f"{CMD} agent-launch"}]}],
+    "SubagentStart": [{"hooks": [
+        {"type": "command", "timeout": 15, "async": True, "command": f"{CMD} agent-start"}]}],
+    "SubagentStop": [{"hooks": [
+        {"type": "command", "timeout": 15, "async": True, "command": f"{CMD} agent-stop"}]}],
     "SessionEnd": [{"hooks": [
         {"type": "command", "timeout": 10, "command": f"{CMD} session-end"}]}],
 }
@@ -177,6 +185,23 @@ def load(sid):
 def save(sid, st):
     p = spath(sid); p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(st), encoding="utf-8")
+
+
+def lock(sid):
+    """훅이 동시에 돌 때(병렬 서브에이전트 등) 상태 파일을 지킨다. 못 잡으면 None."""
+    p = spath(sid).with_suffix(".lock"); p.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(200):                         # 최대 약 10초
+        try:
+            os.close(os.open(p, os.O_CREAT | os.O_EXCL))
+            return p
+        except FileExistsError:
+            try:
+                if time.time() - p.stat().st_mtime > 30:   # 시간 초과로 죽은 훅이 남긴 잠금
+                    p.unlink()
+            except OSError:
+                pass
+            time.sleep(0.05)
+    return None
 
 
 def norm(s): return " ".join(str(s or "").split())
@@ -339,6 +364,7 @@ def h_stop(ev, st, sid):
     if not turns:
         return
     seq, reply = since_stop(ev.get("transcript_path"), st)
+    reply = ev.get("last_assistant_message") or reply
     # transcript 를 읽을 수 없으면 전부 닫는다 (미완료로 남는 것보다 낫다).
     rows = classify(turns, seq) if seq else [(t, "ran", None) for t in turns]
     now, titled, left = time.time(), False, []
@@ -362,10 +388,30 @@ def h_stop(ev, st, sid):
     save(sid, st)
 
 
+def h_idle(ev, st, sid):
+    """입력 대기 알림(idle_prompt): Claude 가 쉬고 있으니 Stop 없이 끝난 턴은 모두 끝난 것이다.
+
+    취소(Esc)에는 훅이 없어서, 사용자가 다음 요청을 보내기 전에는 이 알림
+    (입력 없이 약 60초)이 가장 이른 신호다.
+    """
+    turns = st.get("turns") or []
+    if not any(not t.get("closed") for t in turns):
+        return
+    seq, _ = since_stop(ev.get("transcript_path"), dict(st))   # offset 은 Stop 만 옮긴다
+    for t, state, cut in classify(turns, seq or [], final=True):
+        if t.get("closed") or state is None:
+            continue
+        close(t, "취소됨" if state == "cancelled" else "중단됨", st, cut)
+    save(sid, st)
+
+
 def h_end(ev, st, sid):
     nid = st.get("session_node")
     if not nid:
         return
+    for a in (st.get("agents") or {}).values():
+        try: done(a["id"])
+        except Exception: pass
     turns = st.get("turns") or []
     if any(not t.get("closed") for t in turns):
         seq, _ = since_stop(ev.get("transcript_path"), st)
@@ -384,13 +430,66 @@ def h_end(ev, st, sid):
     spath(sid).unlink(missing_ok=True)
 
 
+def current(st):
+    """메모와 에이전트를 붙일 곳: 열린 턴 중 마지막, 없으면 세션."""
+    return next((t["id"] for t in reversed(st.get("turns") or []) if not t.get("closed")),
+                st.get("session_node"))
+
+
 def h_note(text, st, sid):
-    parent = next((t["id"] for t in reversed(st.get("turns") or []) if not t.get("closed")),
-                  st.get("session_node"))
+    parent = current(st)
     if not parent:
         return
     node(parent, "▸ " + label(text, 300),
          note=scrub(text, 2000) if len(text) > 300 else None)
+
+
+# 서브에이전트: SubagentStart 에는 에이전트 종류만 오므로, 띄울 때(PreToolUse) 적은 설명을
+# 받아 두었다가 시작될 때 노드를 만들고, SubagentStop 에서 소요 시간을 붙여 체크한다.
+
+
+def h_agent_launch(ev, st, sid):
+    i = ev.get("tool_input") or {}
+    now = time.time()
+    wait = [w for w in st.get("agents_wait") or [] if now - w["ts"] < 120]   # 실제로 안 뜬 것은 버린다
+    wait.append({"type": i.get("subagent_type") or "general-purpose",
+                 "desc": i.get("description") or "", "prompt": i.get("prompt") or "", "ts": now})
+    st["agents_wait"] = wait
+    save(sid, st)
+
+
+def h_agent_start(ev, st, sid):
+    wait, typ = st.get("agents_wait") or [], ev.get("agent_type") or ""
+    j = next((j for j, w in enumerate(wait) if w["type"] == typ), 0 if wait else None)
+    if j is None or not current(st):
+        return                                   # Agent 도구로 띄운 게 아닌 것(워크플로 등)은 기록하지 않는다
+    w = wait.pop(j)
+    head = f"\U0001f916 {typ or w['type']}: "
+    nid = node(current(st), head + label(w["desc"], 100), note=scrub(w["prompt"], 2000))
+    a = {"id": nid, "title": head + html_label(w["desc"], 100), "ts": time.time()}
+    ended = (st.get("agents_ended") or {}).pop(ev.get("agent_id"), None)
+    if ended:                                    # Stop 훅이 먼저 처리된 아주 짧은 에이전트
+        finish_agent(a, ended)
+    else:
+        st.setdefault("agents", {})[ev.get("agent_id")] = a
+    save(sid, st)
+
+
+def finish_agent(a, until):
+    edit(a["id"], name=f"{a['title']} <i>· {max(0, until - a['ts']) / 60:.0f}분</i>")
+    done(a["id"])
+
+
+def h_agent_stop(ev, st, sid):
+    a = (st.get("agents") or {}).pop(ev.get("agent_id"), None)
+    if a:
+        finish_agent(a, time.time())
+    else:                                        # 비동기 훅이라 SubagentStart 보다 먼저 올 수 있다
+        now = time.time()
+        ended = {k: v for k, v in (st.get("agents_ended") or {}).items() if now - v < 120}
+        ended[ev.get("agent_id")] = now
+        st["agents_ended"] = ended
+    save(sid, st)
 
 
 def h_link(st, sid):
@@ -582,15 +681,20 @@ def main():
         except Exception: ev = {}
         sid = ev.get("session_id", "")
 
-    st = load(sid)
-    if "turn_node" in st:                        # 1.0.x 상태 파일: 열린 턴을 새 형식으로 옮긴다
-        st.setdefault("turns", []).append({
-            "id": st.pop("turn_node"), "label": st.pop("turn_label", "턴"),
-            "key": "", "ts": st.pop("turn_started", time.time())})
+    lk = lock(sid)
     try:
+        st = load(sid)
+        if "turn_node" in st:                    # 1.0.x 상태 파일: 열린 턴을 새 형식으로 옮긴다
+            st.setdefault("turns", []).append({
+                "id": st.pop("turn_node"), "label": st.pop("turn_label", "턴"),
+                "key": "", "ts": st.pop("turn_started", time.time())})
         if   mode == "session-start": h_start(ev, st, sid)
         elif mode == "prompt":        h_prompt(ev, st, sid)
         elif mode == "stop":          h_stop(ev, st, sid)
+        elif mode == "idle":          h_idle(ev, st, sid)
+        elif mode == "agent-launch":  h_agent_launch(ev, st, sid)
+        elif mode == "agent-start":   h_agent_start(ev, st, sid)
+        elif mode == "agent-stop":    h_agent_stop(ev, st, sid)
         elif mode == "session-end":   h_end(ev, st, sid)
         elif mode == "note":          h_note(text, st, sid)
         elif mode == "close":         h_end({"reason": "manual"}, st, sid)
@@ -599,6 +703,9 @@ def main():
         ERRLOG.parent.mkdir(parents=True, exist_ok=True)
         with ERRLOG.open("a", encoding="utf-8") as f:
             f.write(f"{datetime.now():%F %T} [{mode}] {type(e).__name__}: {e}\n")
+    finally:
+        if lk:
+            lk.unlink(missing_ok=True)
     sys.exit(0)   # 훅은 무슨 일이 있어도 0. exit 2는 세션을 차단한다.
 
 
