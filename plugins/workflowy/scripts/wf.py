@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+"""
+wf.py - Claude Code 세션을 Workflowy에 실시간 기록한다.
+
+설치 (머신당 1회):
+    mkdir -p ~/.claude/hooks && cp wf.py ~/.claude/hooks/wf.py
+    python3 ~/.claude/hooks/wf.py install --key <API_KEY> --root <SHORT_ID>
+
+점검:   python3 ~/.claude/hooks/wf.py doctor
+제거:   python3 ~/.claude/hooks/wf.py uninstall
+"""
+import html, json, os, re, shutil, sys, time, pathlib, urllib.request, urllib.error
+from datetime import datetime
+
+API    = "https://workflowy.com/api/v1"
+HOME   = pathlib.Path.home()
+CFG    = HOME / ".config" / "workflowy"
+CLAUDE = HOME / ".claude"
+DEST   = CLAUDE / "hooks" / "wf.py"
+# 플러그인으로 설치되면 CLAUDE_PLUGIN_DATA(업데이트에도 보존되는 영역)를 쓴다.
+PLUGIN = bool(os.environ.get("CLAUDE_PLUGIN_ROOT"))
+STATE  = pathlib.Path(os.environ.get("CLAUDE_PLUGIN_DATA") or (CLAUDE / "workflowy"))
+ERRLOG = STATE / "error.log"
+MARK   = "<!-- wf-workflowy-logger -->"
+
+SECRET = re.compile(
+    r"sk-[A-Za-z0-9_\-]{12,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}"
+    r"|xox[baprs]-[A-Za-z0-9\-]{10,}|(?i:bearer)\s+[A-Za-z0-9._\-]{20,}"
+    r"|(?i:api[_\-]?key|token|password|secret)\s*[=:]\s*\S{8,}")
+
+# name 필드는 마크다운을 파싱한다. 백슬래시 이스케이프가 통하는 문자들.
+MD = re.compile(r"([*`\[\]])")
+
+CMD = 'python3 "$HOME/.claude/hooks/wf.py"'
+
+HOOKS = {
+    "SessionStart": [{"matcher": "startup|resume|clear", "hooks": [
+        {"type": "command", "timeout": 15, "command": f"{CMD} session-start"}]}],
+    "UserPromptSubmit": [{"hooks": [
+        {"type": "command", "timeout": 10, "command": f"{CMD} prompt"}]}],
+    "PostToolUse": [{"matcher": "Edit|Write|NotebookEdit|Bash|Task|WebFetch|WebSearch|TodoWrite",
+                     "hooks": [
+        {"type": "command", "timeout": 15, "async": True, "command": f"{CMD} tool"}]}],
+    "Stop": [{"hooks": [
+        {"type": "command", "timeout": 10, "command": f"{CMD} stop"}]}],
+    "SessionEnd": [{"hooks": [
+        {"type": "command", "timeout": 10, "command": f"{CMD} session-end"}]}],
+}
+
+SKILL = """---
+name: session-log
+description: 현재 Claude Code 세션의 Workflowy 작업 로그에 의미 있는 메모를 남기거나, 세션 노드 링크를 확인하거나, 세션을 수동으로 마감한다. 계획을 세웠을 때 / 중요한 결정이나 발견이 있을 때 / 막혔을 때 / 사용자가 "workflowy에 기록해"라고 할 때 사용한다.
+argument-hint: [note <텍스트> | link | close]
+---
+
+# Workflowy 작업 로그
+
+도구 호출과 파일 변경은 훅이 자동으로 기록한다.
+이 스킬은 훅이 알 수 없는 **의미 단위 정보**만 기록한다.
+
+현재 세션 ID는 `${CLAUDE_SESSION_ID}` 이다.
+
+## 명령
+
+메모 추가 - 진행 중인 턴 아래에 불릿으로 붙는다:
+
+```bash
+python3 ~/.claude/hooks/wf.py note "${CLAUDE_SESSION_ID}" "계획: 인증을 3단계로 분리"
+```
+
+세션 노드 링크 확인:
+
+```bash
+python3 ~/.claude/hooks/wf.py link "${CLAUDE_SESSION_ID}"
+```
+
+세션 수동 마감 - SessionEnd 훅이 뜨지 않았을 때(강제 종료 등):
+
+```bash
+python3 ~/.claude/hooks/wf.py close "${CLAUDE_SESSION_ID}"
+```
+
+## 무엇을 기록할 가치가 있는가
+
+**기록한다**: 착수 전 계획 / 방향을 바꾼 이유 / 예상 밖의 발견 /
+막힌 지점과 그 원인 / 사용자가 내린 결정.
+
+**기록하지 않는다**: 파일을 읽었다·명령을 실행했다 같은 사실(훅이 이미 적는다) /
+한 줄짜리 진행 중계 / 최종 요약(대화에 이미 있다).
+
+메모 하나는 한 문장. 길어지면 여러 개로 나눈다.
+기록 사실 자체를 사용자에게 보고하지 말고, 조용히 남기고 하던 일을 계속한다.
+"""
+
+MEMO = f"""
+{MARK}
+## Workflowy 작업 로그
+
+이 세션의 작업은 Workflowy에 자동 기록된다. 다음 시점에 `session-log` 스킬로 메모를 남겨라:
+
+- 여러 단계 작업을 시작하기 직전 - 계획 한 줄
+- 접근 방식을 바꿨을 때 - 바꾼 이유
+- 막혔을 때 - 무엇에 왜 막혔는지
+- 사용자가 방향을 결정했을 때 - 결정 내용
+
+기록 자체를 사용자에게 보고하지 마라. 조용히 남기고 하던 일을 계속하라.
+{MARK}
+"""
+
+# ----------------------------------------------------------------- 공통
+
+
+def conf(env, fname):
+    """우선순위: 환경변수 -> 플러그인 userConfig -> ~/.config/workflowy 파일."""
+    v = os.environ.get(env)
+    if v:
+        return v.strip()
+    # 플러그인 userConfig. 문서상 대소문자 표기가 엇갈려 둘 다 확인한다.
+    want = "claude_plugin_option_" + fname
+    for k, val in os.environ.items():
+        if k.lower() == want and val.strip():
+            return val.strip()
+    p = CFG / fname
+    return p.read_text().strip() if p.exists() else None
+
+
+def scrub(s, n=400):
+    s = SECRET.sub("<<redacted>>", str(s or "")).replace("\n", " / ")
+    return (s[:n] + "…") if len(s) > n else s
+
+
+def label(s, n=400):
+    """create용: name 필드의 마크다운 파싱을 중화한다."""
+    return MD.sub(r"\\\1", scrub(s, n)).replace("~~", "∼∼")
+
+
+def html_label(s, n=400):
+    """update용: POST /nodes/:id 는 마크다운이 아니라 HTML만 해석한다."""
+    return html.escape(scrub(s, n), quote=False)
+
+
+def call(method, path, body=None, tries=3):
+    key = conf("WORKFLOWY_API_KEY", "api_key")
+    if not key:
+        raise RuntimeError("Workflowy API key 없음 (install 을 먼저 실행하세요)")
+    data = json.dumps(body).encode() if body is not None else None
+    for i in range(tries):
+        req = urllib.request.Request(API + path, data=data, method=method, headers={
+            "Authorization": "Bearer " + key, "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=6) as r:
+                return json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and i < tries - 1:
+                time.sleep(1.5 * (i + 1)); continue
+            raise
+        except Exception:
+            if i < tries - 1:
+                time.sleep(1.0); continue
+            raise
+
+
+def node(parent, name, note=None, layout=None, pos="bottom"):
+    b = {"parent_id": parent, "name": name, "position": pos}
+    if note:   b["note"] = note[:8000]
+    if layout: b["layoutMode"] = layout
+    return call("POST", "/nodes", b)["item_id"]
+
+
+def edit(nid, **kw): call("POST", f"/nodes/{nid}", kw)
+def done(nid):       call("POST", f"/nodes/{nid}/complete")
+def short(nid):      return nid.split("-")[-1]
+
+def spath(sid): return STATE / "state" / f"{sid}.json"
+
+def load(sid):
+    try:    return json.loads(spath(sid).read_text())
+    except Exception: return {}
+
+def save(sid, st):
+    p = spath(sid); p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(st))
+
+# ----------------------------------------------------------------- 훅
+
+
+def turn_note(st):
+    out = [st.get("prompt", "")]
+    if st.get("todos"):
+        out.append("\n--- 할 일 ---")
+        for t in st["todos"]:
+            m = {"completed": "[x]", "in_progress": "[~]"}.get(t.get("status"), "[ ]")
+            out.append(f"{m} {scrub(t.get('content'), 120)}")
+    return "\n".join(out)
+
+
+def h_start(ev, st, sid):
+    root = conf("WORKFLOWY_ROOT_ID", "root_id")
+    proj = pathlib.Path(ev.get("cwd") or ".").name
+    why  = ev.get("session_start_reason") or ev.get("source") or "?"
+    nid  = node(root, f"## {proj} · {datetime.now():%Y-%m-%d %H:%M}",
+                note=f"cwd: {ev.get('cwd')}\nsession: {sid}\nstart: {why}")
+    st.update(session_node=nid, started=time.time(), tools=0)
+    save(sid, st)
+    print(f"[workflowy] 이 세션의 작업 로그: https://workflowy.com/#/{short(nid)}")
+    if PLUGIN:
+        # 플러그인은 사용자의 CLAUDE.md 를 건드릴 수 없다.
+        # SessionStart 의 stdout 은 Claude 에게 전달되므로 여기서 상시 지시를 준다.
+        print("도구 호출과 파일 변경은 자동 기록된다. 다음 시점에는 /workflowy:session-log 스킬로 "
+              "한 문장 메모를 남겨라: 여러 단계 작업 착수 직전(계획), 접근 방식을 "
+              "바꿨을 때(이유), 막혔을 때(무엇에 왜), 사용자가 방향을 정했을 때(결정). "
+              "기록 사실 자체는 사용자에게 보고하지 말 것.")
+
+
+def h_prompt(ev, st, sid):
+    if not st.get("session_node"):
+        return
+    st["prompt"] = scrub(ev.get("prompt"), 2000)
+    ts = f"{datetime.now():%H:%M} "
+    nid = node(st["session_node"], ts + label(ev.get("prompt"), 110),
+               note=st["prompt"], layout="todo")
+    st.update(turn_node=nid, turn_label=ts + html_label(ev.get("prompt"), 110),
+              turn_started=time.time(), turn_tools=0, todos=[])
+    save(sid, st)
+
+
+def h_tool(ev, st, sid):
+    parent = st.get("turn_node") or st.get("session_node")
+    if not parent:
+        return
+    t = ev.get("tool_name", "")
+    i = ev.get("tool_input") or {}
+    if t == "TodoWrite":
+        st["todos"] = i.get("todos") or []
+        save(sid, st)
+        if st.get("turn_node"):
+            edit(st["turn_node"], note=turn_note(st))
+        return
+    if t == "Bash":
+        nm, nt = "$ " + label(i.get("command"), 100), scrub(i.get("command"), 2000)
+    elif t in ("Edit", "Write", "NotebookEdit"):
+        nm, nt = "✏️ " + label(i.get("file_path"), 150), None
+    elif t == "Task":
+        nm, nt = "\U0001f916 " + label(i.get("description"), 100), scrub(i.get("prompt"), 2000)
+    elif t in ("WebFetch", "WebSearch"):
+        nm, nt = "\U0001f310 " + label(i.get("url") or i.get("query"), 120), None
+    else:
+        nm, nt = "· " + t, None
+    node(parent, nm, note=nt)
+    st["turn_tools"] = st.get("turn_tools", 0) + 1
+    st["tools"] = st.get("tools", 0) + 1
+    save(sid, st)
+
+
+def h_stop(ev, st, sid):
+    nid = st.get("turn_node")
+    if not nid:
+        return
+    mins = (time.time() - st.get("turn_started", time.time())) / 60
+    edit(nid, name=f"{st.get('turn_label','턴')} <i>· {mins:.0f}분 · "
+                   f"{st.get('turn_tools',0)}회</i>")
+    done(nid)
+    st.pop("turn_node", None)
+    save(sid, st)
+
+
+def h_end(ev, st, sid):
+    nid = st.get("session_node")
+    if not nid:
+        return
+    if st.get("turn_node"):
+        try: done(st["turn_node"])
+        except Exception: pass
+    mins = (time.time() - st.get("started", time.time())) / 60
+    node(nid, f"⏹ 종료 · {ev.get('reason','?')} · {mins:.0f}분 · "
+              f"도구 {st.get('tools',0)}회")
+    done(nid)
+    spath(sid).unlink(missing_ok=True)
+
+
+def h_note(text, st, sid):
+    parent = st.get("turn_node") or st.get("session_node")
+    if not parent:
+        return
+    node(parent, "▸ " + label(text, 300),
+         note=scrub(text, 2000) if len(text) > 300 else None)
+
+
+def h_link(st, sid):
+    nid = st.get("session_node")
+    print(f"https://workflowy.com/#/{short(nid)}" if nid else "기록 중인 세션 없음")
+
+# ----------------------------------------------------------------- 설치
+
+
+def _ours(block):
+    return any("wf.py" in h.get("command", "") for h in block.get("hooks", []))
+
+
+def _write_settings(remove=False):
+    p = CLAUDE / "settings.json"
+    cur = {}
+    if p.exists():
+        try:
+            cur = json.loads(p.read_text())
+        except Exception:
+            print(f"  !! {p} 가 올바른 JSON이 아닙니다. 건드리지 않고 중단합니다.")
+            return False
+        shutil.copy(p, p.with_suffix(".json.bak"))
+    hooks = cur.get("hooks", {})
+    for ev in list(HOOKS):                       # 재설치 대비: 기존 wf 블록 먼저 제거
+        kept = [b for b in hooks.get(ev, []) if not _ours(b)]
+        if not remove:
+            kept += HOOKS[ev]
+        if kept: hooks[ev] = kept
+        elif ev in hooks: del hooks[ev]
+    if hooks: cur["hooks"] = hooks
+    elif "hooks" in cur: del cur["hooks"]
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(cur, indent=2, ensure_ascii=False) + "\n")
+    return True
+
+
+def _write_memo(remove=False):
+    p = CLAUDE / "CLAUDE.md"
+    cur = p.read_text() if p.exists() else ""
+    if MARK in cur:                              # 기존 블록 제거 (idempotent)
+        a, _, rest = cur.partition(MARK)
+        _, _, b = rest.partition(MARK)
+        cur = (a.rstrip() + "\n" + b.lstrip()).strip()
+    if not remove:
+        cur = (cur + "\n" + MEMO).strip() + "\n"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(cur + ("\n" if cur and not cur.endswith("\n") else ""))
+
+
+def do_install(argv):
+    key  = _arg(argv, "--key")  or os.environ.get("WORKFLOWY_API_KEY")
+    root = _arg(argv, "--root") or os.environ.get("WORKFLOWY_ROOT_ID")
+    if (not key or not root) and sys.stdin.isatty():
+        key  = key  or input("Workflowy API Key: ").strip()
+        root = root or input("root node short ID: ").strip()
+    if not key or not root:
+        print("사용법: python3 wf.py install --key <API_KEY> --root <SHORT_ID>")
+        return 1
+
+    CFG.mkdir(parents=True, exist_ok=True)
+    (CFG / "api_key").write_text(key)
+    (CFG / "root_id").write_text(root)
+    os.chmod(CFG, 0o700)
+    for f in ("api_key", "root_id"):
+        os.chmod(CFG / f, 0o600)
+    print(f"  ok  자격 증명  -> {CFG}/ (0600)")
+
+    src = pathlib.Path(__file__).resolve()
+    DEST.parent.mkdir(parents=True, exist_ok=True)
+    if src != DEST.resolve():
+        shutil.copy(src, DEST)
+    os.chmod(DEST, 0o755)
+    print(f"  ok  스크립트    -> {DEST}")
+
+    if not _write_settings():
+        return 1
+    print(f"  ok  훅 5개      -> {CLAUDE}/settings.json  (기존 설정 보존, .bak 생성)")
+
+    sk = CLAUDE / "skills" / "session-log" / "SKILL.md"
+    sk.parent.mkdir(parents=True, exist_ok=True)
+    sk.write_text(SKILL)
+    print(f"  ok  스킬        -> {sk}")
+
+    _write_memo()
+    print(f"  ok  상시 지시   -> {CLAUDE}/CLAUDE.md")
+
+    print("\n연결 확인 중...")
+    return do_doctor()
+
+
+def do_uninstall():
+    _write_settings(remove=True)
+    _write_memo(remove=True)
+    shutil.rmtree(CLAUDE / "skills" / "session-log", ignore_errors=True)
+    shutil.rmtree(STATE, ignore_errors=True)
+    DEST.unlink(missing_ok=True)
+    print("제거 완료. 자격 증명(~/.config/workflowy)은 남겨뒀습니다.")
+    return 0
+
+
+def do_doctor():
+    ok = True
+    key, root = conf("WORKFLOWY_API_KEY", "api_key"), conf("WORKFLOWY_ROOT_ID", "root_id")
+    print(f"  {'ok ' if key else 'FAIL'} API key      {'설정됨' if key else '없음'}")
+    print(f"  {'ok ' if root else 'FAIL'} root id      {root or '없음'}")
+    ok &= bool(key and root)
+
+    if PLUGIN:
+        print(f"  ok  설치 형태    플러그인 ({os.environ['CLAUDE_PLUGIN_ROOT']})")
+        print(f"  ok  상태 저장    {STATE}")
+        return _doctor_api(key, root, ok)
+
+    for lbl, p in [("스크립트", DEST), ("설정", CLAUDE / "settings.json"),
+                   ("스킬", CLAUDE / "skills" / "session-log" / "SKILL.md"),
+                   ("상시 지시", CLAUDE / "CLAUDE.md")]:
+        e = p.exists()
+        print(f"  {'ok ' if e else 'FAIL'} {lbl:10s} {p if e else '없음'}")
+        ok &= e
+
+    try:
+        n = json.loads((CLAUDE / "settings.json").read_text()).get("hooks", {})
+        have = [e for e in HOOKS if any(_ours(b) for b in n.get(e, []))]
+        good = len(have) == len(HOOKS)
+        print(f"  {'ok ' if good else 'FAIL'} 훅 등록      {len(have)}/{len(HOOKS)}  {have}")
+        ok &= good
+    except Exception as e:
+        print(f"  FAIL 훅 등록      {e}"); ok = False
+
+    return _doctor_api(key, root, ok)
+
+
+def _doctor_api(key, root, ok):
+    if key and root:
+        try:
+            t0 = time.time()
+            nm = call("GET", f"/nodes/{root}")["node"]["name"]
+            print(f"  ok  API 연결     '{nm}' ({time.time()-t0:.2f}초)")
+        except urllib.error.HTTPError as e:
+            code = {401: "API key가 잘못됨", 403: "권한 없음",
+                    404: "root id를 찾을 수 없음"}.get(e.code, f"HTTP {e.code}")
+            print(f"  FAIL API 연결     {code}"); ok = False
+        except Exception as e:
+            print(f"  FAIL API 연결     {type(e).__name__}: {e}"); ok = False
+
+    if ERRLOG.exists() and ERRLOG.stat().st_size:
+        print(f"\n  주의: {ERRLOG} 에 기록된 오류가 있습니다 (마지막 3줄)")
+        for ln in ERRLOG.read_text().strip().split("\n")[-3:]:
+            print("        " + ln)
+
+    print("\n" + ("전부 정상. Claude Code를 새로 시작하면 기록이 시작됩니다."
+                  if ok else "문제가 있습니다. 위의 FAIL 항목을 확인하세요."))
+    return 0 if ok else 1
+
+
+def _arg(argv, name):
+    if name in argv:
+        i = argv.index(name)
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    for a in argv:
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return None
+
+# ----------------------------------------------------------------- 진입점
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "doctor"
+
+    if mode == "install":   sys.exit(do_install(sys.argv[2:]))
+    if mode == "uninstall": sys.exit(do_uninstall())
+    if mode == "doctor":    sys.exit(do_doctor())
+
+    ev, text = {}, ""
+    if mode in ("note", "close", "link"):
+        sid  = sys.argv[2] if len(sys.argv) > 2 else ""
+        text = " ".join(sys.argv[3:])
+    else:
+        try: ev = json.loads(sys.stdin.read() or "{}")
+        except Exception: ev = {}
+        sid = ev.get("session_id", "")
+
+    st = load(sid)
+    try:
+        if   mode == "session-start": h_start(ev, st, sid)
+        elif mode == "prompt":        h_prompt(ev, st, sid)
+        elif mode == "tool":          h_tool(ev, st, sid)
+        elif mode == "stop":          h_stop(ev, st, sid)
+        elif mode == "session-end":   h_end(ev, st, sid)
+        elif mode == "note":          h_note(text, st, sid)
+        elif mode == "close":         h_end({"reason": "manual"}, st, sid)
+        elif mode == "link":          h_link(st, sid)
+    except Exception as e:
+        ERRLOG.parent.mkdir(parents=True, exist_ok=True)
+        with ERRLOG.open("a") as f:
+            f.write(f"{datetime.now():%F %T} [{mode}] {type(e).__name__}: {e}\n")
+    sys.exit(0)   # 훅은 무슨 일이 있어도 0. exit 2는 세션을 차단한다.
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "startup|resume|clear",
+        "hooks": [{ "type": "command", "timeout": 15,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" session-start" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "timeout": 10,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" prompt" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Edit|Write|NotebookEdit|Bash|Task|WebFetch|WebSearch|TodoWrite",
+        "hooks": [{ "type": "command", "timeout": 15, "async": true,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" tool" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "timeout": 10,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" stop" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "timeout": 10,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" session-end" }] }
+    ]
+  }
+}
