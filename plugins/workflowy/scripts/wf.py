@@ -219,6 +219,11 @@ def when(r):
 
 
 TASK_DONE = re.compile(r"<tool-use-id>([^<]+)</tool-use-id>.*?<status>([^<]+)</status>", re.S)
+LAUNCHED  = re.compile(r"Async agent launched.*?agentId: ([0-9a-f]+)", re.S)
+HANDBACK  = re.compile(r'<agent-message from="([0-9a-f]+)">')
+# 기계가 넣은 턴: 에이전트 보고, 완료 알림, 시스템 알림, 로컬 명령 출력. 사용자 요청이 아니다.
+SYSTEM    = re.compile(r"\s*(<(agent-message|task-notification|system-reminder|local-command-caveat)\b"
+                       r"|Another Claude session sent a message:|\[SYSTEM NOTIFICATION)")
 
 
 def since_stop(path, st):
@@ -226,9 +231,11 @@ def since_stop(path, st):
 
     사건은 (종류, 정규화된 텍스트, 시각) 이다. user 는 직접 입력한 요청(type=user 의
     텍스트), 작업 중에 끼어든 대기열 요청(queued_command 첨부), 취소 표시 등이고,
-    assistant 는 Claude 가 응답을 시작했다는 표시다. 판단할 수 없으면 사건 목록은 None.
-    끝난 도구 호출은 {tool_use_id: 상태} 로, 메인 세션이 받은 결과(tool_result)와
-    백그라운드 에이전트의 완료 알림(<task-notification>)에서 모은다.
+    sys 는 기계가 넣은 턴(에이전트 보고·완료 알림 등), assistant 는 Claude 가 응답을
+    시작했다는 표시다. 판단할 수 없으면 사건 목록은 None.
+    끝난 도구 호출은 {tool_use_id: 상태} 로, 메인 세션이 받은 결과(tool_result),
+    백그라운드 에이전트의 보고(<agent-message>)와 완료 알림(<task-notification>)에서 모은다.
+    보고는 agentId 로 오므로, 띄울 때의 tool_result 에서 agentId -> tool_use_id 를 배워 둔다.
     """
     try:
         with open(path, "rb") as f:
@@ -256,7 +263,10 @@ def since_stop(path, st):
             for b in content if isinstance(content, list) else []:
                 if isinstance(b, dict) and b.get("type") == "tool_result":
                     out = json.dumps(b.get("content"), ensure_ascii=False)
-                    if "Async agent launched" not in out:   # 백그라운드 에이전트는 완료 알림으로 끝난다
+                    m = LAUNCHED.search(out)
+                    if m:                                    # 백그라운드 에이전트: 보고나 완료 알림으로 끝난다
+                        st.setdefault("agent_ids", {})[m.group(1)] = b.get("tool_use_id")
+                    else:
                         finished[b.get("tool_use_id")] = "failed" if b.get("is_error") else "completed"
             c = texts(content)
         elif r.get("type") == "attachment" and a.get("type") == "queued_command":
@@ -264,9 +274,14 @@ def since_stop(path, st):
         else:
             continue
         if isinstance(c, str) and c.strip():
-            finished.update(TASK_DONE.findall(c) if "<task-notification>" in c else [])
-            seq.append(("user", norm(c), when(r)))
-    if not any(k == "user" for k, _, _ in seq):  # 턴마다 요청이 최소 하나는 있다. 없으면 형식이 바뀐 것
+            if "<task-notification>" in c:
+                finished.update(TASK_DONE.findall(c))
+            for aid in HANDBACK.findall(c):          # 에이전트의 보고가 메인 세션에 전달됐다
+                tid = (st.get("agent_ids") or {}).get(aid)
+                if tid:
+                    finished.setdefault(tid, "completed")
+            seq.append(("sys" if SYSTEM.match(c) else "user", norm(c), when(r)))
+    if not any(k in ("user", "sys") for k, _, _ in seq):  # 턴마다 요청이 최소 하나는 있다. 없으면 형식이 바뀐 것
         return None, None, finished
     return seq, reply, finished
 
@@ -288,7 +303,8 @@ def classify(turns, seq, final=False):
         pos.append(i)
         if i is not None:
             start = i                            # 대기열 요청 여럿이 한 메시지로 전달될 수 있다
-    marks = sorted({p for p in pos if p is not None})
+    # 기계가 넣은 턴도 구간 경계다. 취소된 요청 뒤에 온 알림 턴의 응답이 그 요청의 것으로 잡히면 안 된다.
+    marks = sorted({p for p in pos if p is not None} | {i for i, e in enumerate(seq) if e[0] == "sys"})
     out = []
     for t, p in zip(turns, pos):
         if p is None:
@@ -340,13 +356,22 @@ def close(t, text, st, until=None):
     """턴의 제목을 확정한다. text 가 없으면 요청 앞부분을, until 이 있으면 소요 시간을 붙인다."""
     name = f"{t['hm']} {text}" if text and t.get("hm") else t["label"]
     if until:
-        name += f" <i>· {max(0, until - max(t['ts'], st.get('last_stop', 0))) / 60:.0f}분</i>"
+        name += duration(until - max(t["ts"], st.get("last_stop", 0)))
     edit(t["id"], name=name)
     t["closed"] = True                           # 다음 Stop 까지 구간 경계로 남겨 둔다
 
 
+def duration(secs):
+    """소요 시간 표시. 1분 미만은 정보가 없어 붙이지 않는다."""
+    return f" <i>· {secs / 60:.0f}분</i>" if secs >= 60 else ""
+
+
 def h_prompt(ev, st, sid):
     if not st.get("session_node"):
+        return
+    # 에이전트 보고·완료 알림처럼 기계가 넣은 턴은 요청이 아니므로 기록하지 않는다.
+    # source 필드가 아직 없는 버전을 위해 내용으로도 판단한다.
+    if ev.get("source", "user") != "user" or SYSTEM.match(ev.get("prompt") or ""):
         return
     turns = st.setdefault("turns", [])
     if any(not t.get("closed") for t in turns):
@@ -374,7 +399,7 @@ def h_stop(ev, st, sid):
     reply = ev.get("last_assistant_message") or reply
     now = time.time()
     # 에이전트의 결과를 받아 응답한 메인 세션이 그 응답으로 보고한다.
-    # 완료 알림만 받고 끝나는 턴은 UserPromptSubmit 이 없어 턴 노드가 없지만, 여기서 처리된다.
+    # 보고·완료 알림으로 시작된 턴은 턴 노드가 없지만(h_prompt 가 걸러냄) 여기서 처리된다.
     agents = st.get("agents") or {}
     for tid, status in finished.items():
         if tid in agents:
@@ -483,9 +508,11 @@ def h_agent_launch(ev, st, sid):
 
 def finish_agent(a, until, status="completed", report=None):
     """'진행 중' 을 결과로 바꾸고, 메인 세션의 응답을 노트 첫 줄에 보고로 남겨 접혀 있어도 보이게 한다."""
-    tail = (f"{max(0, until - a['ts']) / 60:.0f}분" if status == "completed"
-            else {"failed": "실패", "killed": "중단됨", "stopped": "중단됨"}.get(status, status))
-    kw = {"name": f"{a['title']} <i>· {tail}</i>"}
+    if status == "completed":
+        tail = duration(until - a["ts"])
+    else:
+        tail = f" <i>· {({'failed': '실패', 'killed': '중단됨', 'stopped': '중단됨'}).get(status, status)}</i>"
+    kw = {"name": a["title"] + tail}
     if report:
         kw["note"] = f"결과: {scrub(report, 6000)}\n\n지시: {a.get('ask', '')}"
     edit(a["id"], **kw)
