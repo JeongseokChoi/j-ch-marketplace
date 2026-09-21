@@ -121,7 +121,7 @@ def conf(env, fname):
         if k.lower() == want and val.strip():
             return val.strip()
     p = CFG / fname
-    return p.read_text().strip() if p.exists() else None
+    return p.read_text(encoding="utf-8").strip() if p.exists() else None
 
 
 def scrub(s, n=400):
@@ -174,12 +174,12 @@ def short(nid):      return nid.split("-")[-1]
 def spath(sid): return STATE / "state" / f"{sid}.json"
 
 def load(sid):
-    try:    return json.loads(spath(sid).read_text())
+    try:    return json.loads(spath(sid).read_text(encoding="utf-8"))
     except Exception: return {}
 
 def save(sid, st):
     p = spath(sid); p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(st))
+    p.write_text(json.dumps(st), encoding="utf-8")
 
 # ----------------------------------------------------------------- 훅
 
@@ -302,7 +302,7 @@ def _write_settings(remove=False):
     cur = {}
     if p.exists():
         try:
-            cur = json.loads(p.read_text())
+            cur = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             print(f"  !! {p} 가 올바른 JSON이 아닙니다. 건드리지 않고 중단합니다.")
             return False
@@ -317,13 +317,13 @@ def _write_settings(remove=False):
     if hooks: cur["hooks"] = hooks
     elif "hooks" in cur: del cur["hooks"]
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(cur, indent=2, ensure_ascii=False) + "\n")
+    p.write_text(json.dumps(cur, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return True
 
 
 def _write_memo(remove=False):
     p = CLAUDE / "CLAUDE.md"
-    cur = p.read_text() if p.exists() else ""
+    cur = p.read_text(encoding="utf-8") if p.exists() else ""
     if MARK in cur:                              # 기존 블록 제거 (idempotent)
         a, _, rest = cur.partition(MARK)
         _, _, b = rest.partition(MARK)
@@ -331,7 +331,7 @@ def _write_memo(remove=False):
     if not remove:
         cur = (cur + "\n" + MEMO).strip() + "\n"
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(cur + ("\n" if cur and not cur.endswith("\n") else ""))
+    p.write_text(cur + ("\n" if cur and not cur.endswith("\n") else ""), encoding="utf-8")
 
 
 def do_install(argv):
@@ -345,8 +345,8 @@ def do_install(argv):
         return 1
 
     CFG.mkdir(parents=True, exist_ok=True)
-    (CFG / "api_key").write_text(key)
-    (CFG / "root_id").write_text(root)
+    (CFG / "api_key").write_text(key, encoding="utf-8")
+    (CFG / "root_id").write_text(root, encoding="utf-8")
     os.chmod(CFG, 0o700)
     for f in ("api_key", "root_id"):
         os.chmod(CFG / f, 0o600)
@@ -365,7 +365,7 @@ def do_install(argv):
 
     sk = CLAUDE / "skills" / "session-log" / "SKILL.md"
     sk.parent.mkdir(parents=True, exist_ok=True)
-    sk.write_text(SKILL)
+    sk.write_text(SKILL, encoding="utf-8")
     print(f"  ok  스킬        -> {sk}")
 
     _write_memo()
@@ -405,7 +405,7 @@ def do_doctor():
         ok &= e
 
     try:
-        n = json.loads((CLAUDE / "settings.json").read_text()).get("hooks", {})
+        n = json.loads((CLAUDE / "settings.json").read_text(encoding="utf-8")).get("hooks", {})
         have = [e for e in HOOKS if any(_ours(b) for b in n.get(e, []))]
         good = len(have) == len(HOOKS)
         print(f"  {'ok ' if good else 'FAIL'} 훅 등록      {len(have)}/{len(HOOKS)}  {have}")
@@ -431,7 +431,7 @@ def _doctor_api(key, root, ok):
 
     if ERRLOG.exists() and ERRLOG.stat().st_size:
         print(f"\n  주의: {ERRLOG} 에 기록된 오류가 있습니다 (마지막 3줄)")
-        for ln in ERRLOG.read_text().strip().split("\n")[-3:]:
+        for ln in ERRLOG.read_text(encoding="utf-8").strip().split("\n")[-3:]:
             print("        " + ln)
 
     print("\n" + ("전부 정상. Claude Code를 새로 시작하면 기록이 시작됩니다."
@@ -453,6 +453,13 @@ def _arg(argv, name):
 
 
 def main():
+    # Windows 에서 파이프로 연결된 표준 입출력은 로캘 인코딩(cp949 등)을 쓴다.
+    # Claude Code 는 훅과 UTF-8 로 주고받으므로 명시적으로 맞춘다.
+    # 입력의 깨진 바이트는 서로게이트가 되어 API 가 500 을 내므로 치환한다.
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
     mode = sys.argv[1] if len(sys.argv) > 1 else "doctor"
 
     if mode == "install":   sys.exit(do_install(sys.argv[2:]))
@@ -480,7 +487,7 @@ def main():
         elif mode == "link":          h_link(st, sid)
     except Exception as e:
         ERRLOG.parent.mkdir(parents=True, exist_ok=True)
-        with ERRLOG.open("a") as f:
+        with ERRLOG.open("a", encoding="utf-8") as f:
             f.write(f"{datetime.now():%F %T} [{mode}] {type(e).__name__}: {e}\n")
     sys.exit(0)   # 훅은 무슨 일이 있어도 0. exit 2는 세션을 차단한다.
 
