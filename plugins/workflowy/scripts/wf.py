@@ -272,6 +272,11 @@ def prose(para):
         return None
     if LIST_ITEM.match(lines[0]):
         para = lines[0]                          # 목록은 첫 항목만. 이어 붙이면 다음 항목 번호가 섞인다
+    else:
+        # 빈 줄 없이 바로 이어진 목록은 뺀다. 이어 붙이면 "… 1." 처럼 목록 번호가 문장 끝으로 잡힌다
+        cut = next((n for n, l in enumerate(lines) if LIST_ITEM.match(l)), None)
+        if cut:
+            para = "\n".join(lines[:cut])
     para = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", para)       # [x](url) -> x
     para = LIST_ITEM.sub("", para)
     para = re.sub(r"^\s*(?:#{1,6}|>)\s*", "", para, flags=re.M)  # 제목·인용 기호 (#1 같은 번호는 살린다)
@@ -400,7 +405,7 @@ def h_prompt(ev, st, sid):
     # 요청 전문은 노트에 있으므로 제목은 시각만 두고, 턴이 끝나면 응답의 첫 문장으로 채운다.
     p = norm(ev.get("prompt"))
     hm = f"{datetime.now():%H:%M}"
-    nid = node(st["session_node"], hm, note=scrub(ev.get("prompt"), 2000, lines=True))
+    nid = node(st["session_node"], hm, note="prompt:\n" + scrub(ev.get("prompt"), 2000, lines=True))
     turns.append({
         "id": nid, "hm": hm, "label": f"{hm} " + html_label(ev.get("prompt"), 110),
         # 슬래시 명령은 transcript 에 이름과 인자가 따로 남으므로 이름만 맞춘다
@@ -446,8 +451,9 @@ def h_stop(ev, st, sid):
         elif titled:
             close(t, "↳ 앞 요청과 함께 처리", st, now); steps += t.get("steps", [])
         elif reply:
-            # 보고에 답한 턴은 요청이 없으므로 노트에 답변 전문을 남긴다 (요청 턴의 노트는 요청 전문)
-            note = plain(scrub(reply, 6000, lines=True)) if t.get("kind") == "handback" else None
+            # 보고에 답한 턴은 요청이 없으므로 노트에 답변 전문을 남긴다 (요청 턴의 노트는 요청 전문).
+            # 끝나면 제목은 일반 턴과 같아지므로 첫 줄의 response: 가 요청 턴(prompt:)과 구분해 준다
+            note = ("response:\n" + plain(scrub(reply, 6000, lines=True))) if t.get("kind") == "handback" else None
             close(t, html_label(headline(reply), 100), st, now, note)
             titled = t; steps += t.get("steps", [])
         else:
