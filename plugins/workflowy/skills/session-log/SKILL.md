@@ -1,48 +1,33 @@
 ---
 name: session-log
-description: 현재 Claude Code 세션의 Workflowy 작업 로그에 의미 있는 메모를 남기거나, 세션 노드 링크를 확인하거나, 세션을 수동으로 마감한다. 계획을 세웠을 때 / 중요한 결정이나 발견이 있을 때 / 막혔을 때 / 사용자가 "workflowy에 기록해"라고 할 때 사용한다.
-argument-hint: [note <텍스트> | link | close]
+description: 현재 Claude Code 세션의 Workflowy 작업 로그에 의미 있는 메모를 남기거나, 세션 노드 링크 확인·수동 마감·설정 점검을 한다. 계획을 세웠을 때 / 중요한 결정이나 발견이 있을 때 / 막혔을 때 / 사용자가 "workflowy에 기록해"라고 할 때 사용한다.
+argument-hint: [<메모> | note <메모> | link | close | doctor]
 ---
 
 # Workflowy 작업 로그
 
-사용자 요청은 훅이 턴 단위로 자동 기록한다.
+사용자 요청은 턴 단위로, 도구 호출의 description 은 턴 아래 진행 단계로 훅이 자동 기록한다.
 이 스킬은 훅이 알 수 없는 **의미 단위 정보**를 기록한다.
 
-현재 세션 ID는 `${CLAUDE_SESSION_ID}` 이다.
+**이 스킬은 부르는 것만으로 처리된다. 따로 명령을 실행하지 않는다.**
+인자는 훅이 받아 바로 기록한다 (Bash 로 실행하면 API key 가 없어 기록되지 않는다).
 
-## 명령
+| 인자 | 동작 |
+|---|---|
+| `<메모>` 또는 `note <메모>` | 진행 중인 턴 아래에 `▸ 메모` 로 기록 |
+| `link` (또는 인자 없음) | 이 세션 노드의 링크 |
+| `close` | 세션 수동 마감 — SessionEnd 훅이 뜨지 않았을 때(강제 종료 등) |
+| `doctor` | 설정·연결·최근 오류 점검 |
 
-메모 추가 — 진행 중인 턴 아래에 불릿으로 붙는다:
-
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/wf.py" note "${CLAUDE_SESSION_ID}" "계획: 인증을 3단계로 분리"
-```
-
-세션 노드 링크 확인:
-
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/wf.py" link "${CLAUDE_SESSION_ID}"
-```
-
-세션 수동 마감 — SessionEnd 훅이 뜨지 않았을 때(강제 종료 등):
-
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/wf.py" close "${CLAUDE_SESSION_ID}"
-```
-
-설정 점검:
-
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/wf.py" doctor
-```
+메모가 기록되면 아무 알림도 오지 않는다. 링크·마감·점검 결과와 기록 실패는 훅이 이 메시지 뒤에
+`[workflowy]` 로 알려준다. 그 내용은 사용자에게 전한다.
 
 ## 무엇을 기록할 가치가 있는가
 
 **기록한다**: 착수 전 계획 / 방향을 바꾼 이유 / 예상 밖의 발견 /
 막힌 지점과 그 원인 / 사용자가 내린 결정.
 
-**기록하지 않는다**: 파일을 읽었다·명령을 실행했다 같은 단순 사실 /
+**기록하지 않는다**: 파일을 읽었다·명령을 실행했다 같은 단순 사실(진행 단계로 이미 남는다) /
 한 줄짜리 진행 중계 / 최종 요약(대화에 이미 있다).
 
 메모 하나는 한 문장. 길어지면 여러 개로 나눈다.

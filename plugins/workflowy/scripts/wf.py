@@ -1,27 +1,20 @@
 #!/usr/bin/env python3
 """
-wf.py - Claude Code 세션을 Workflowy에 실시간 기록한다.
+wf.py - Claude Code 세션을 Workflowy에 실시간 기록한다. workflowy 플러그인의 훅이 부른다.
 
-설치 (머신당 1회):
-    mkdir -p ~/.claude/hooks && cp wf.py ~/.claude/hooks/wf.py
-    python3 ~/.claude/hooks/wf.py install --key <API_KEY> --root <SHORT_ID>
-
-점검:   python3 ~/.claude/hooks/wf.py doctor
-제거:   python3 ~/.claude/hooks/wf.py uninstall
+API key 와 상태 저장 위치는 플러그인이 훅 프로세스에만 넘겨준다(CLAUDE_PLUGIN_OPTION_*,
+CLAUDE_PLUGIN_DATA). Claude 가 Bash 도구로 실행하면 둘 다 없어서 기록할 수 없다.
+그래서 session-log 스킬도 Claude 가 명령을 실행하는 대신 훅이 스킬 호출을 받아 처리한다.
 """
-import html, json, os, re, shutil, sys, time, pathlib, urllib.request, urllib.error
+import html, io, json, os, re, shutil, subprocess, sys, time, pathlib, urllib.request, urllib.error
+from contextlib import redirect_stdout
 from datetime import datetime
 
 API    = "https://workflowy.com/api/v1"
-HOME   = pathlib.Path.home()
-CFG    = HOME / ".config" / "workflowy"
-CLAUDE = HOME / ".claude"
-DEST   = CLAUDE / "hooks" / "wf.py"
-# 플러그인으로 설치되면 CLAUDE_PLUGIN_DATA(업데이트에도 보존되는 영역)를 쓴다.
-PLUGIN = bool(os.environ.get("CLAUDE_PLUGIN_ROOT"))
-STATE  = pathlib.Path(os.environ.get("CLAUDE_PLUGIN_DATA") or (CLAUDE / "workflowy"))
-ERRLOG = STATE / "error.log"
-MARK   = "<!-- wf-workflowy-logger -->"
+DATA   = os.environ.get("CLAUDE_PLUGIN_DATA")
+STATE  = pathlib.Path(DATA) if DATA else None       # 업데이트에도 보존되는 플러그인 데이터 영역
+ERRLOG = STATE / "error.log" if STATE else None
+SKILL  = re.compile(r"^/(?:workflowy:)?session-log\b\s*(.*)$", re.S)   # 사용자가 직접 입력한 스킬
 
 SECRET = re.compile(
     r"sk-[A-Za-z0-9_\-]{12,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}"
@@ -31,98 +24,19 @@ SECRET = re.compile(
 # name 필드는 마크다운을 파싱한다. 백슬래시 이스케이프가 통하는 문자들.
 MD = re.compile(r"([*`\[\]])")
 
-CMD = 'python3 "$HOME/.claude/hooks/wf.py"'
-
-HOOKS = {
-    "SessionStart": [{"matcher": "startup|resume|clear", "hooks": [
-        {"type": "command", "timeout": 15, "command": f"{CMD} session-start"}]}],
-    "UserPromptSubmit": [{"hooks": [
-        {"type": "command", "timeout": 10, "command": f"{CMD} prompt"}]}],
-    "Stop": [{"hooks": [
-        {"type": "command", "timeout": 10, "command": f"{CMD} stop"}]}],
-    "Notification": [{"matcher": "idle_prompt", "hooks": [
-        {"type": "command", "timeout": 15, "async": True, "command": f"{CMD} idle"}]}],
-    "PreToolUse": [{"matcher": "Agent|Task", "hooks": [
-        {"type": "command", "timeout": 15, "async": True, "command": f"{CMD} agent-launch"}]}],
-    "SessionEnd": [{"hooks": [
-        {"type": "command", "timeout": 10, "command": f"{CMD} session-end"}]}],
-}
-
-SKILL = """---
-name: session-log
-description: 현재 Claude Code 세션의 Workflowy 작업 로그에 의미 있는 메모를 남기거나, 세션 노드 링크를 확인하거나, 세션을 수동으로 마감한다. 계획을 세웠을 때 / 중요한 결정이나 발견이 있을 때 / 막혔을 때 / 사용자가 "workflowy에 기록해"라고 할 때 사용한다.
-argument-hint: [note <텍스트> | link | close]
----
-
-# Workflowy 작업 로그
-
-사용자 요청은 훅이 턴 단위로 자동 기록한다.
-이 스킬은 훅이 알 수 없는 **의미 단위 정보**를 기록한다.
-
-현재 세션 ID는 `${CLAUDE_SESSION_ID}` 이다.
-
-## 명령
-
-메모 추가 - 진행 중인 턴 아래에 불릿으로 붙는다:
-
-```bash
-python3 ~/.claude/hooks/wf.py note "${CLAUDE_SESSION_ID}" "계획: 인증을 3단계로 분리"
-```
-
-세션 노드 링크 확인:
-
-```bash
-python3 ~/.claude/hooks/wf.py link "${CLAUDE_SESSION_ID}"
-```
-
-세션 수동 마감 - SessionEnd 훅이 뜨지 않았을 때(강제 종료 등):
-
-```bash
-python3 ~/.claude/hooks/wf.py close "${CLAUDE_SESSION_ID}"
-```
-
-## 무엇을 기록할 가치가 있는가
-
-**기록한다**: 착수 전 계획 / 방향을 바꾼 이유 / 예상 밖의 발견 /
-막힌 지점과 그 원인 / 사용자가 내린 결정.
-
-**기록하지 않는다**: 파일을 읽었다·명령을 실행했다 같은 단순 사실 /
-한 줄짜리 진행 중계 / 최종 요약(대화에 이미 있다).
-
-메모 하나는 한 문장. 길어지면 여러 개로 나눈다.
-기록 사실 자체를 사용자에게 보고하지 말고, 조용히 남기고 하던 일을 계속한다.
-"""
-
-MEMO = f"""
-{MARK}
-## Workflowy 작업 로그
-
-이 세션의 사용자 요청은 Workflowy에 턴 단위로 자동 기록된다. 다음 시점에 `session-log` 스킬로 메모를 남겨라:
-
-- 여러 단계 작업을 시작하기 직전 - 계획 한 줄
-- 접근 방식을 바꿨을 때 - 바꾼 이유
-- 막혔을 때 - 무엇에 왜 막혔는지
-- 사용자가 방향을 결정했을 때 - 결정 내용
-
-기록 자체를 사용자에게 보고하지 마라. 조용히 남기고 하던 일을 계속하라.
-{MARK}
-"""
-
 # ----------------------------------------------------------------- 공통
 
 
-def conf(env, fname):
-    """우선순위: 환경변수 -> 플러그인 userConfig -> ~/.config/workflowy 파일."""
+def conf(env, key):
+    """우선순위: 환경변수 -> 플러그인 userConfig (CLAUDE_PLUGIN_OPTION_<KEY>)."""
     v = os.environ.get(env)
     if v:
         return v.strip()
-    # 플러그인 userConfig. 문서상 대소문자 표기가 엇갈려 둘 다 확인한다.
-    want = "claude_plugin_option_" + fname
+    want = "claude_plugin_option_" + key             # 문서는 대문자로 쓰지만 대소문자를 가리지 않는다
     for k, val in os.environ.items():
         if k.lower() == want and val.strip():
             return val.strip()
-    p = CFG / fname
-    return p.read_text(encoding="utf-8").strip() if p.exists() else None
+    return None
 
 
 def scrub(s, n=400, lines=False):
@@ -153,7 +67,7 @@ def html_label(s, n=400):
 def call(method, path, body=None, tries=3):
     key = conf("WORKFLOWY_API_KEY", "api_key")
     if not key:
-        raise RuntimeError("Workflowy API key 없음 (install 을 먼저 실행하세요)")
+        raise RuntimeError("Workflowy API key 없음 (플러그인 설정의 api_key 를 확인하세요)")
     data = json.dumps(body).encode() if body is not None else None
     for i in range(tries):
         req = urllib.request.Request(API + path, data=data, method=method, headers={
@@ -243,6 +157,23 @@ SYSTEM    = re.compile(r"\s*(<(agent-message|task-notification|system-reminder|l
                        r"|Another Claude session sent a message:|\[SYSTEM NOTIFICATION)")
 
 
+def records(path, start, end=None):
+    """transcript 의 [start, end) 구간에서 온전한 줄만 JSON 으로 읽는다. (레코드 목록, 다 읽은 위치)"""
+    with open(path, "rb") as f:
+        f.seek(start)
+        data = f.read() if end is None else f.read(max(0, end - start))
+    stop = data.rfind(b"\n") + 1                 # 쓰는 중인 마지막 줄은 다음에 읽는다
+    out = []
+    for line in data[:stop].splitlines():
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if not r.get("isSidechain"):
+            out.append(r)
+    return out, start + stop
+
+
 def since_stop(path, st):
     """마지막 Stop 이후 transcript 를 읽어 (사건 목록, 마지막 응답, 끝난 도구 호출) 을 돌려준다.
 
@@ -255,21 +186,11 @@ def since_stop(path, st):
     보고는 agentId 로 오므로, 띄울 때의 tool_result 에서 agentId -> tool_use_id 를 배워 둔다.
     """
     try:
-        with open(path, "rb") as f:
-            f.seek(st.get("offset", 0))
-            data = f.read()
+        recs, st["offset"] = records(path, st.get("offset", 0))
     except Exception:
         return None, None, {}
-    end = data.rfind(b"\n") + 1                  # 쓰는 중인 마지막 줄은 다음 Stop 에서 읽는다
-    st["offset"] = st.get("offset", 0) + end
     seq, reply, finished = [], None, {}
-    for line in data[:end].splitlines():
-        try:
-            r = json.loads(line)
-        except Exception:
-            continue
-        if r.get("isSidechain"):
-            continue
+    for r in recs:
         a = r.get("attachment") or {}
         if r.get("type") == "assistant":
             seq.append(("assistant", "", when(r)))
@@ -341,13 +262,43 @@ def classify(turns, seq, final=False):
     return out
 
 
-def headline(text):
-    """응답의 첫 문장. 응답은 결론부터 쓰므로 그 턴의 작업과 결과를 요약한다."""
-    para = text.strip().split("\n\n")[0]
+LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+
+def prose(para):
+    """제목에 쓸 수 있는 문단이면 기호를 걷어낸 한 줄, 아니면(코드·표·목록 뒤 문단 등) None."""
+    lines = para.strip().splitlines()
+    if not lines or lines[0].lstrip().startswith(("```", "|")):
+        return None
+    if LIST_ITEM.match(lines[0]):
+        para = lines[0]                          # 목록은 첫 항목만. 이어 붙이면 다음 항목 번호가 섞인다
     para = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", para)       # [x](url) -> x
-    para = re.sub(r"^\s*(?:[-*+]|\d+\.)\s+", "", para)          # 목록 기호
-    para = norm(re.sub(r"[*`#>|]", "", para))                    # 마크다운 기호
-    return re.split(r"(?<=[.!?])\s", para, maxsplit=1)[0]
+    para = LIST_ITEM.sub("", para)
+    para = re.sub(r"^\s*(?:#{1,6}|>)\s*", "", para, flags=re.M)  # 제목·인용 기호 (#1 같은 번호는 살린다)
+    return norm(re.sub(r"[*`|]", "", para))
+
+
+def headline(text):
+    """응답의 첫 문장. 응답은 결론부터 쓰므로 그 턴의 작업과 결과를 요약한다.
+
+    "고쳤습니다." 처럼 첫 문장이 짧아 내용이 없으면 다음 문장을 이어 붙인다.
+    """
+    paras = [p for p in text.strip().split("\n\n") if p.strip()]
+    first = prose(paras[0]) if paras else None
+    if not first:
+        return ""
+    heading = paras[0].lstrip().startswith("#")
+    sents = re.split(r"(?<=[.!?])\s+", first)
+    out = sents[0]
+    if heading:                                  # 머리말은 그 자체로 제목이다
+        return out
+    rest = sents[1:] + [s for p in paras[1:2] if not p.lstrip().startswith("#")
+                        for s in re.split(r"(?<=[.!?])\s+", prose(p) or "") if s]
+    for s in rest:
+        if len(out) >= 20:
+            break
+        out += " " + s
+    return out
 
 # ----------------------------------------------------------------- 훅
 
@@ -363,13 +314,36 @@ def h_start(ev, st, sid):
               offset=os.path.getsize(tp) if tp and os.path.exists(tp) else 0)
     save(sid, st)
     print(f"[workflowy] 이 세션의 작업 로그: https://workflowy.com/#/{short(nid)}")
-    if PLUGIN:
-        # 플러그인은 사용자의 CLAUDE.md 를 건드릴 수 없다.
-        # SessionStart 의 stdout 은 Claude 에게 전달되므로 여기서 상시 지시를 준다.
-        print("사용자 요청은 턴 단위로 자동 기록된다. 다음 시점에는 /workflowy:session-log 스킬로 "
-              "한 문장 메모를 남겨라: 여러 단계 작업 착수 직전(계획), 접근 방식을 "
-              "바꿨을 때(이유), 막혔을 때(무엇에 왜), 사용자가 방향을 정했을 때(결정). "
-              "기록 사실 자체는 사용자에게 보고하지 말 것.")
+    # 플러그인은 사용자의 CLAUDE.md 를 건드릴 수 없다.
+    # SessionStart 의 stdout 은 Claude 에게 전달되므로 여기서 상시 지시를 준다.
+    print("사용자 요청은 턴 단위로 자동 기록된다.\n"
+          "- 도구의 description 은 사용자와 대화하는 언어로, 지금 하는 일을 명사형으로 짧게 쓴다 "
+          "(예: '설치본과 저장소 코드 비교'). 턴 아래에 진행 단계로 그대로 기록된다.\n"
+          "- 다음 시점에는 /workflowy:session-log 스킬에 한 문장을 인자로 넘겨 메모를 남긴다: "
+          "여러 단계 작업 착수 직전(계획), 접근 방식을 바꿨을 때(이유), 막혔을 때(무엇에 왜), "
+          "사용자가 방향을 정했을 때(결정). 스킬을 부르는 것만으로 기록되니 명령을 따로 실행하지 않는다.\n"
+          "- 기록 사실 자체는 사용자에게 보고하지 않는다.")
+    new = new_errors()
+    if new:
+        print(f"[workflowy] 지난 확인 이후 기록 오류 {len(new)}건. 마지막: {new[-1]}\n"
+              "사용자에게 알리고, 자세한 점검은 /workflowy:session-log doctor 로 한다.")
+
+
+def new_errors():
+    """지난 세션 시작 이후 쌓인 오류 줄. 기록 실패가 조용히 묻히지 않게 한 번씩 알린다."""
+    seen = STATE / "error.seen"
+    try:
+        size = ERRLOG.stat().st_size
+        done = int(seen.read_text()) if seen.exists() else 0
+        if size <= done:
+            return []
+        with ERRLOG.open("rb") as f:
+            f.seek(done if done <= size else 0)
+            lines = f.read().decode("utf-8", "replace").strip().splitlines()
+        seen.write_text(str(size))
+        return lines
+    except OSError:
+        return []
 
 
 def close(t, text, st, until=None, note=None):
@@ -388,16 +362,19 @@ def duration(secs):
 
 def h_prompt(ev, st, sid):
     if not st.get("session_node"):
-        return
+        return None
     turns = st.setdefault("turns", [])
+    p = ev.get("prompt") or ""
+    m = SKILL.match(p.strip())
+    if m:                                        # 사용자가 직접 부른 session-log 는 요청이 아니라 기록 명령이다
+        return session_cmd(m.group(1), st, sid)
     # 기계가 넣은 턴은 요청이 아니므로 기록하지 않는다 (source 필드가 없는 버전은 내용으로 판단).
     # 다만 에이전트의 보고에 메인 세션이 답하는 턴은 메인 세션의 일이므로 턴으로 남긴다.
     # 작업 중에 끼어든 보고는 진행 중인 턴 안에서 처리되므로 따로 만들지 않는다.
-    p = ev.get("prompt") or ""
     if ev.get("source", "user") != "user" or SYSTEM.match(p):
         m = HANDBACK.search(p)
         if not m or any(not t.get("closed") for t in turns):
-            return
+            return None
         a = (st.get("agents") or {}).get((st.get("agent_ids") or {}).get(m.group(1)), {})
         desc = a.get("title", "에이전트").split(": ", 1)[-1]
         hm = f"{datetime.now():%H:%M}"
@@ -408,7 +385,8 @@ def h_prompt(ev, st, sid):
                       "kind": "handback", "agent": desc, "key": f'<agent-message from="{m.group(1)}"',
                       "ts": time.time()})
         save(sid, st)
-        return
+        return None
+    busy = False
     if any(not t.get("closed") for t in turns):
         # 취소(Esc)나 도구 거부로 끝난 턴에는 Stop 이 오지 않으므로 다음 요청이 올 때 닫는다.
         # offset 은 Stop 만 옮긴다. 여기서는 복사본으로 읽기만 한다.
@@ -416,6 +394,7 @@ def h_prompt(ev, st, sid):
         for t, state, cut in classify(turns, seq or []):
             if state == "interrupted" and not t.get("closed"):
                 close(t, "중단됨", st, cut)
+        busy = any(not t.get("closed") for t in turns)
     # 작업 중에 대기열에 넣은 요청도 이 훅은 넣는 순간 한 번만 불린다(꺼낼 때는 안 불린다).
     # 그래서 열린 턴을 덮어쓰지 않고 목록에 쌓아 두고, 제목은 Stop 에서 전달 여부로 판단해 확정한다.
     # 요청 전문은 노트에 있으므로 제목은 시각만 두고, 턴이 끝나면 응답의 첫 문장으로 채운다.
@@ -425,12 +404,16 @@ def h_prompt(ev, st, sid):
     turns.append({
         "id": nid, "hm": hm, "label": f"{hm} " + html_label(ev.get("prompt"), 110),
         # 슬래시 명령은 transcript 에 이름과 인자가 따로 남으므로 이름만 맞춘다
-        "key": p.split(" ")[0] if p.startswith("/") else p[:40], "ts": time.time()})
+        "key": p.split(" ")[0] if p.startswith("/") else p[:40], "ts": time.time(),
+        # 작업 중에 넣은 요청: 진행 단계는 아직 하던 턴에 붙인다
+        **({"queued": True} if busy else {})})
     save(sid, st)
+    return None
 
 
 def h_stop(ev, st, sid):
-    seq, reply, finished = since_stop(ev.get("transcript_path"), st)
+    tp, frm = ev.get("transcript_path"), st.get("offset", 0)
+    seq, reply, finished = since_stop(tp, st)
     reply = ev.get("last_assistant_message") or reply
     now = time.time()
     # 에이전트의 결과를 받아 응답한 메인 세션이 그 응답으로 보고한다.
@@ -446,25 +429,34 @@ def h_stop(ev, st, sid):
         return
     # transcript 를 읽을 수 없으면 전부 처리된 것으로 본다.
     rows = classify(turns, seq) if seq else [(t, "ran", None) for t in turns]
-    titled, left = False, []
+    titled, left, steps = None, [], []
     for t, state, cut in rows:
         if t.get("closed"):
             continue
         if state is None:
-            # 아직 전달 안 된 대기열 요청은 다음 턴이 된다. 두 번째 Stop 까지 못 맞추면 요청 앞부분으로 확정한다.
+            # 아직 전달 안 된 대기열 요청은 다음 턴이 된다. 그 아래 붙은 단계는 이번 턴의 것이다.
+            # 두 번째 Stop 까지 못 맞추면 요청 앞부분으로 확정한다.
+            steps += t.pop("steps", []); t.pop("queued", None)
             t["waits"] = t.get("waits", 0) + 1
             if t["waits"] < 2:
                 left.append(t); continue
             close(t, None, st)
         elif state == "interrupted": close(t, "중단됨", st, cut)
         elif state == "cancelled":   close(t, "취소됨", st)
-        elif titled:                 close(t, "↳ 앞 요청과 함께 처리", st, now)
+        elif titled:
+            close(t, "↳ 앞 요청과 함께 처리", st, now); steps += t.get("steps", [])
         elif reply:
             # 보고에 답한 턴은 요청이 없으므로 노트에 답변 전문을 남긴다 (요청 턴의 노트는 요청 전문)
             note = plain(scrub(reply, 6000, lines=True)) if t.get("kind") == "handback" else None
-            close(t, html_label(headline(reply), 100), st, now, note); titled = True
+            close(t, html_label(headline(reply), 100), st, now, note)
+            titled = t; steps += t.get("steps", [])
         else:
             close(t, None, st, now)              # 응답을 못 찾으면 요청 앞부분을 쓴다
+    if titled and tp:
+        # 진행 중에 남긴 단계를 턴이 끝난 뒤 결과까지 담은 목록으로 바꾼다 (refine 훅이 비동기로 처리)
+        st.setdefault("refine", []).append({
+            "turn": titled["id"], "key": titled["key"], "handback": titled.get("kind") == "handback",
+            "steps": steps, "path": tp, "from": frm, "to": st["offset"]})
     st.update(turns=left, last_stop=now)
     save(sid, st)
 
@@ -516,12 +508,207 @@ def current(st):
                 st.get("session_node"))
 
 
+def working(st):
+    """진행 단계를 붙일 턴: 작업 중에 대기열에 넣은 요청이 아니라 지금 처리 중인 턴."""
+    open_ = [t for t in st.get("turns") or [] if not t.get("closed")]
+    return next((t for t in reversed(open_) if not t.get("queued")), open_[-1] if open_ else None)
+
+
 def h_note(text, st, sid):
     parent = current(st)
     if not parent:
-        return
+        raise RuntimeError("기록 중인 세션이 없음 (세션 시작 훅이 실패했을 수 있음)")
     node(parent, "▸ " + label(text, 300),
          note=scrub(text, 2000, lines=True) if len(text) > 300 else None)
+
+
+# ----------------------------------------------------------------- session-log 스킬
+# Claude 가 Skill 도구로 부르면 PostToolUse, 사용자가 /workflowy:session-log 로 입력하면
+# UserPromptSubmit 이 인자를 받는다. 둘 다 훅이라 API key 와 상태에 접근할 수 있다.
+
+
+def session_cmd(args, st, sid):
+    """스킬 인자를 처리하고 Claude 에게 돌려줄 말을 만든다. 메모가 성공하면 아무 말도 하지 않는다."""
+    a = (args or "").strip()
+    cmd, _, rest = a.partition(" ")
+    if cmd in ("", "link"):
+        nid = st.get("session_node")
+        return f"[workflowy] 이 세션의 작업 로그: https://workflowy.com/#/{short(nid)}" if nid \
+            else "[workflowy] 기록 중인 세션이 없습니다."
+    if cmd == "close":
+        h_end({"reason": "manual"}, st, sid)
+        return "[workflowy] 세션 기록을 마감했습니다."
+    if cmd == "doctor":
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            do_doctor()
+        return "[workflowy] 점검 결과\n" + buf.getvalue()
+    text = rest.strip() if cmd == "note" else a
+    if not text:
+        return "[workflowy] 메모 내용이 비어 있어 기록하지 않았습니다."
+    h_note(text, st, sid)
+    return None
+
+
+def h_skill(ev, st, sid):
+    i = ev.get("tool_input") or {}
+    if ev.get("agent_id") or not str(i.get("skill", "")).endswith("session-log"):
+        return None
+    return session_cmd(i.get("args"), st, sid)
+
+
+# ----------------------------------------------------------------- 진행 단계
+# 도구를 부를 때마다 Claude 가 붙이는 description 이 곧 "지금 하는 일" 이다.
+# 도구가 시작될 때(PreToolUse) 그 문구를 진행 중인 턴 아래에 단계로 붙이고,
+# 턴이 끝나면 refine 훅이 단계들을 결과까지 담은 명사형 목록으로 바꾼다.
+
+
+def step_of(ev):
+    """단계로 남길 문구. 없으면 None. 잠금·상태 없이 판단할 수 있어야 한다(도구마다 불린다)."""
+    if ev.get("agent_id"):
+        return None                              # 서브에이전트가 부른 도구는 메인 세션의 단계가 아니다
+    i = ev.get("tool_input") if isinstance(ev.get("tool_input"), dict) else {}
+    d = norm(i.get("description"))
+    if not d or ev.get("tool_name") == "Skill":
+        return None
+    return ("\U0001f916 " if ev.get("tool_name") in ("Agent", "Task") else "") + d
+
+
+def h_pre_tool(ev, st, sid):
+    if ev.get("agent_id") or not st.get("session_node"):
+        return                                   # 서브에이전트가 띄운 것은 메인 세션의 일이 아니다
+    if ev.get("tool_name") in ("Agent", "Task"):
+        agent_launch(ev, st)
+    d, t = step_of(ev), working(st)
+    if d and t and d != t.get("last_step"):
+        t.setdefault("steps", []).append(node(t["id"], label(d, 200)))
+        t["last_step"] = d
+    save(sid, st)
+
+
+SUMMARY = """너는 작업 기록을 정리한다. 입력은 AI 코딩 에이전트가 사용자 요청 하나를 처리한 과정이다
+(요청, 에이전트의 중간 설명, 도구 호출과 결과, 최종 응답).
+에이전트가 한 일을 순서대로 한 줄에 하나씩 나열하라.
+
+- 한 줄은 60자 안팎, 명사형 어미로 간결하게 끝낸다. 예: "설치된 1.9.1과 저장소 코드 비교, 동일함 확인",
+  "서브에이전트에게 공식 문서 확인 위임", "문제점 6건과 개선안 정리, 결정 사항 질문"
+- 의미 있는 결과나 발견이 있으면 쉼표 뒤에 덧붙인다. 도구 결과·중간 설명·최종 응답에 드러난 것만 쓰고,
+  드러나지 않은 결론은 짐작해 쓰지 않는다. 결과가 분명하지 않으면 한 일만 쓴다.
+- 같은 목적의 연이은 도구 호출은 한 줄로 합친다. 명령어나 경로를 옮기지 말고 무엇을 했는지 쓴다.
+- 마지막 줄은 최종 응답에서 사용자에게 한 일(보고·제안·질문)이다.
+- 사용자 요청과 같은 언어로 쓴다.
+- 목록만 출력한다. 번호·기호·머리말·맺음말을 붙이지 않는다."""
+
+
+def brief(i):
+    """description 이 없는 도구 호출(Read·Edit 등)의 대상."""
+    for k in ("file_path", "notebook_path", "pattern", "url", "query", "skill", "command", "prompt"):
+        if isinstance(i, dict) and i.get(k):
+            v = str(i[k])
+            return pathlib.PureWindowsPath(v).name if k.endswith("path") else norm(v)[:100]
+    return ""
+
+
+def digest(job):
+    """refine 입력: 턴 구간의 transcript 를 요청·설명·도구·결과·응답으로 줄인 글. 도구 호출 수도 센다."""
+    recs, _ = records(job["path"], job["from"], job["to"])
+    start = 0
+    for n, r in enumerate(recs):                 # 이 턴의 요청부터 (앞의 중단된 턴 작업은 뺀다)
+        c = texts((r.get("message") or {}).get("content")) if r.get("type") == "user" else ""
+        if c and job["key"] in norm(c):
+            start = n; break
+    out, tools, said = [], 0, None
+    for r in recs[start:]:
+        content = (r.get("message") or {}).get("content")
+        if r.get("type") == "assistant":
+            for b in content if isinstance(content, list) else []:
+                if b.get("type") == "text" and b.get("text", "").strip():
+                    said, final = len(out), b["text"]
+                    out.append("(설명) " + scrub(b["text"], 400))
+                elif b.get("type") == "tool_use":
+                    tools += 1
+                    i = b.get("input") or {}
+                    out.append(f"(도구) {b.get('name')}: " + (norm(i.get("description")) or brief(i)))
+        elif r.get("type") == "user" and not r.get("isMeta"):   # isMeta: 불러온 스킬 본문 등
+            for b in content if isinstance(content, list) else []:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    res = texts(b.get("content")) or str(b.get("content") or "")
+                    out.append("  -> " + scrub(norm(res), 300))
+            c = texts(content)
+            if c.strip():
+                out.append(("[요청]\n" + scrub(c, 1500, lines=True)) if not out else
+                           ("(보고 도착) " if SYSTEM.match(c) else "(사용자) ") + scrub(norm(c), 300))
+    if said is not None:                         # 마지막 설명이 최종 응답이다. 결론이 여기 있으므로 길게 둔다
+        out[said] = "[최종 응답]\n" + scrub(final, 2500, lines=True)
+    text = "\n".join(out)
+    return (text[:30000] + "\n…(생략)") if len(text) > 30000 else text, tools
+
+
+def summarize(text):
+    """Haiku 로 명사형 단계 목록을 만든다. 이 호출은 사용자의 Claude 계정으로 청구된다."""
+    exe = os.environ.get("CLAUDE_CODE_EXECPATH") or shutil.which("claude")
+    if not exe:
+        raise RuntimeError("claude 실행 파일을 찾지 못함")
+    # 부모 세션의 흔적을 지워 독립된 세션으로 띄운다. 사용자 설정을 읽지 않으므로 플러그인·훅도 뜨지 않고,
+    # WF_DISABLE 은 그래도 이 플러그인이 뜰 경우 기록하지 않게 하는 안전장치다.
+    env = {k: v for k, v in os.environ.items()
+           if k != "CLAUDECODE" and not k.startswith(("CLAUDE_CODE_", "CLAUDE_PLUGIN_"))}
+    # 확장 사고를 끈다. 켜 두면 목록 몇 줄에 수천 토큰을 생각하느라 40초 이상 걸린다 (끄면 10초 안팎).
+    env.update(WF_DISABLE="1", MAX_THINKING_TOKENS="0")
+    r = subprocess.run(
+        [exe, "-p", "--model", "haiku", "--no-session-persistence", "--setting-sources", "project",
+         "--settings", '{"alwaysThinkingEnabled": false}',
+         "--tools", "", "--strict-mcp-config", "--disable-slash-commands", "--system-prompt", SUMMARY],
+        input=text, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=100, cwd=str(STATE), env=env)
+    if r.returncode:
+        raise RuntimeError(f"claude -p 실패 ({r.returncode}): {norm(r.stderr or r.stdout)[:200]}")
+    lines = [LIST_ITEM.sub("", l).strip(" •·") for l in r.stdout.splitlines()]
+    return [l for l in lines if l][:40]
+
+
+def refine_one(job):
+    text, tools = digest(job)
+    if not tools:
+        return                                   # 도구를 쓰지 않은 턴은 응답이 곧 전부다
+    lines = summarize(text)
+    if not lines:
+        return
+    for s in reversed(lines):                    # 맨 위부터 순서대로. 턴 중에 남긴 ▸ 메모는 그 아래에 남는다
+        node(job["turn"], label(s, 200), pos="top")
+    for nid in job["steps"]:
+        try: call("DELETE", f"/nodes/{nid}")
+        except urllib.error.HTTPError as e:
+            if e.code != 404: raise
+
+
+def do_refine(ev, sid):
+    """Stop 과 함께 뜨는 비동기 훅. stop 훅이 넘겨준 정리 작업을 가져와 처리한다.
+
+    두 훅은 동시에 시작되므로, stop 훅이 이번 Stop 을 처리할 때까지 잠시 기다린다.
+    stop 훅은 transcript 를 끝까지 읽고 그 위치를 남기므로, 그 위치가 지금 크기에 닿았으면 처리가 끝난 것이다.
+    """
+    began, jobs = time.time(), []
+    try:    size = os.path.getsize(ev.get("transcript_path") or "")
+    except OSError: size = 0
+    while True:
+        lk = lock(sid)
+        try:
+            st = load(sid)
+            jobs = st.pop("refine", [])
+            if jobs:
+                save(sid, st)
+            done = not st or st.get("offset", 0) >= size
+        finally:
+            if lk: lk.unlink(missing_ok=True)
+        if jobs or done or time.time() - began > 15:
+            break
+        time.sleep(0.3)
+    for job in jobs:
+        try:
+            refine_one(job)
+        except Exception as e:
+            log_error("refine", e)
 
 
 # 서브에이전트: 일은 서브에이전트가 하고 기록은 메인 세션이 한다.
@@ -531,9 +718,7 @@ def h_note(text, st, sid):
 # 에이전트는 턴이 끝난 뒤에도 일할 수 있고 턴 노드는 접혀 보이므로, 세션 바로 아래(턴과 같은 단계)에 둔다.
 
 
-def h_agent_launch(ev, st, sid):
-    if ev.get("agent_id") or not st.get("session_node"):
-        return                                   # 서브에이전트가 띄운 것은 메인 세션의 일이 아니다
+def agent_launch(ev, st):
     i = ev.get("tool_input") or {}
     head = f"{datetime.now():%H:%M} \U0001f916 {i.get('subagent_type') or 'general-purpose'}: "
     ask = scrub(i.get("prompt"), 1500, lines=True)
@@ -541,7 +726,6 @@ def h_agent_launch(ev, st, sid):
                note="지시: " + ask)
     st.setdefault("agents", {})[ev.get("tool_use_id")] = {
         "id": nid, "title": head + html_label(i.get("description"), 100), "ts": time.time(), "ask": ask}
-    save(sid, st)
 
 
 def finish_agent(a, until, status="completed", report=None):
@@ -555,104 +739,7 @@ def finish_agent(a, until, status="completed", report=None):
         kw["note"] = f"결과: {plain(scrub(report, 6000, lines=True))}\n\n지시: {a.get('ask', '')}"
     edit(a["id"], **kw)
 
-
-def h_link(st, sid):
-    nid = st.get("session_node")
-    print(f"https://workflowy.com/#/{short(nid)}" if nid else "기록 중인 세션 없음")
-
-# ----------------------------------------------------------------- 설치
-
-
-def _ours(block):
-    return any("wf.py" in h.get("command", "") for h in block.get("hooks", []))
-
-
-def _write_settings(remove=False):
-    p = CLAUDE / "settings.json"
-    cur = {}
-    if p.exists():
-        try:
-            cur = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            print(f"  !! {p} 가 올바른 JSON이 아닙니다. 건드리지 않고 중단합니다.")
-            return False
-        shutil.copy(p, p.with_suffix(".json.bak"))
-    hooks = cur.get("hooks", {})
-    for ev in set(hooks) | set(HOOKS):           # 재설치 대비: 기존 wf 블록 먼저 제거 (폐지된 이벤트 포함)
-        kept = [b for b in hooks.get(ev, []) if not _ours(b)]
-        if not remove:
-            kept += HOOKS.get(ev, [])
-        if kept: hooks[ev] = kept
-        elif ev in hooks: del hooks[ev]
-    if hooks: cur["hooks"] = hooks
-    elif "hooks" in cur: del cur["hooks"]
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(cur, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    return True
-
-
-def _write_memo(remove=False):
-    p = CLAUDE / "CLAUDE.md"
-    cur = p.read_text(encoding="utf-8") if p.exists() else ""
-    if MARK in cur:                              # 기존 블록 제거 (idempotent)
-        a, _, rest = cur.partition(MARK)
-        _, _, b = rest.partition(MARK)
-        cur = (a.rstrip() + "\n" + b.lstrip()).strip()
-    if not remove:
-        cur = (cur + "\n" + MEMO).strip() + "\n"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(cur + ("\n" if cur and not cur.endswith("\n") else ""), encoding="utf-8")
-
-
-def do_install(argv):
-    key  = _arg(argv, "--key")  or os.environ.get("WORKFLOWY_API_KEY")
-    root = _arg(argv, "--root") or os.environ.get("WORKFLOWY_ROOT_ID")
-    if (not key or not root) and sys.stdin.isatty():
-        key  = key  or input("Workflowy API Key: ").strip()
-        root = root or input("root node short ID: ").strip()
-    if not key or not root:
-        print("사용법: python3 wf.py install --key <API_KEY> --root <SHORT_ID>")
-        return 1
-
-    CFG.mkdir(parents=True, exist_ok=True)
-    (CFG / "api_key").write_text(key, encoding="utf-8")
-    (CFG / "root_id").write_text(root, encoding="utf-8")
-    os.chmod(CFG, 0o700)
-    for f in ("api_key", "root_id"):
-        os.chmod(CFG / f, 0o600)
-    print(f"  ok  자격 증명  -> {CFG}/ (0600)")
-
-    src = pathlib.Path(__file__).resolve()
-    DEST.parent.mkdir(parents=True, exist_ok=True)
-    if src != DEST.resolve():
-        shutil.copy(src, DEST)
-    os.chmod(DEST, 0o755)
-    print(f"  ok  스크립트    -> {DEST}")
-
-    if not _write_settings():
-        return 1
-    print(f"  ok  훅 5개      -> {CLAUDE}/settings.json  (기존 설정 보존, .bak 생성)")
-
-    sk = CLAUDE / "skills" / "session-log" / "SKILL.md"
-    sk.parent.mkdir(parents=True, exist_ok=True)
-    sk.write_text(SKILL, encoding="utf-8")
-    print(f"  ok  스킬        -> {sk}")
-
-    _write_memo()
-    print(f"  ok  상시 지시   -> {CLAUDE}/CLAUDE.md")
-
-    print("\n연결 확인 중...")
-    return do_doctor()
-
-
-def do_uninstall():
-    _write_settings(remove=True)
-    _write_memo(remove=True)
-    shutil.rmtree(CLAUDE / "skills" / "session-log", ignore_errors=True)
-    shutil.rmtree(STATE, ignore_errors=True)
-    DEST.unlink(missing_ok=True)
-    print("제거 완료. 자격 증명(~/.config/workflowy)은 남겨뒀습니다.")
-    return 0
+# ----------------------------------------------------------------- 점검
 
 
 def do_doctor():
@@ -660,33 +747,10 @@ def do_doctor():
     key, root = conf("WORKFLOWY_API_KEY", "api_key"), conf("WORKFLOWY_ROOT_ID", "root_id")
     print(f"  {'ok ' if key else 'FAIL'} API key      {'설정됨' if key else '없음'}")
     print(f"  {'ok ' if root else 'FAIL'} root id      {root or '없음'}")
+    print(f"  ok  상태 저장    {STATE}")
+    exe = os.environ.get("CLAUDE_CODE_EXECPATH") or shutil.which("claude")
+    print(f"  {'ok ' if exe else '주의'} 단계 정리    {exe or 'claude 실행 파일 없음 (진행 단계를 정리하지 못함)'}")
     ok &= bool(key and root)
-
-    if PLUGIN:
-        print(f"  ok  설치 형태    플러그인 ({os.environ['CLAUDE_PLUGIN_ROOT']})")
-        print(f"  ok  상태 저장    {STATE}")
-        return _doctor_api(key, root, ok)
-
-    for lbl, p in [("스크립트", DEST), ("설정", CLAUDE / "settings.json"),
-                   ("스킬", CLAUDE / "skills" / "session-log" / "SKILL.md"),
-                   ("상시 지시", CLAUDE / "CLAUDE.md")]:
-        e = p.exists()
-        print(f"  {'ok ' if e else 'FAIL'} {lbl:10s} {p if e else '없음'}")
-        ok &= e
-
-    try:
-        n = json.loads((CLAUDE / "settings.json").read_text(encoding="utf-8")).get("hooks", {})
-        have = [e for e in HOOKS if any(_ours(b) for b in n.get(e, []))]
-        good = len(have) == len(HOOKS)
-        print(f"  {'ok ' if good else 'FAIL'} 훅 등록      {len(have)}/{len(HOOKS)}  {have}")
-        ok &= good
-    except Exception as e:
-        print(f"  FAIL 훅 등록      {e}"); ok = False
-
-    return _doctor_api(key, root, ok)
-
-
-def _doctor_api(key, root, ok):
     if key and root:
         try:
             t0 = time.time()
@@ -700,26 +764,20 @@ def _doctor_api(key, root, ok):
             print(f"  FAIL API 연결     {type(e).__name__}: {e}"); ok = False
 
     if ERRLOG.exists() and ERRLOG.stat().st_size:
-        print(f"\n  주의: {ERRLOG} 에 기록된 오류가 있습니다 (마지막 3줄)")
-        for ln in ERRLOG.read_text(encoding="utf-8").strip().split("\n")[-3:]:
+        print(f"\n  주의: {ERRLOG} 에 기록된 오류가 있습니다 (마지막 5줄)")
+        for ln in ERRLOG.read_text(encoding="utf-8").strip().split("\n")[-5:]:
             print("        " + ln)
 
-    print("\n" + ("전부 정상. Claude Code를 새로 시작하면 기록이 시작됩니다."
-                  if ok else "문제가 있습니다. 위의 FAIL 항목을 확인하세요."))
+    print("\n" + ("전부 정상." if ok else "문제가 있습니다. 위의 FAIL 항목을 확인하세요."))
     return 0 if ok else 1
 
-
-def _arg(argv, name):
-    if name in argv:
-        i = argv.index(name)
-        if i + 1 < len(argv):
-            return argv[i + 1]
-    for a in argv:
-        if a.startswith(name + "="):
-            return a.split("=", 1)[1]
-    return None
-
 # ----------------------------------------------------------------- 진입점
+
+
+def log_error(mode, e):
+    ERRLOG.parent.mkdir(parents=True, exist_ok=True)
+    with ERRLOG.open("a", encoding="utf-8") as f:
+        f.write(f"{datetime.now():%F %T} [{mode}] {type(e).__name__}: {e}\n")
 
 
 def main():
@@ -729,47 +787,50 @@ def main():
     sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
+    if os.environ.get("WF_DISABLE"):
+        sys.exit(0)                              # 단계 정리용 claude -p 세션은 기록하지 않는다
 
     mode = sys.argv[1] if len(sys.argv) > 1 else "doctor"
+    if not STATE:
+        print("[workflowy] 플러그인 훅 밖에서 실행되어 API key 와 기록 상태를 쓸 수 없습니다.\n"
+              "메모·링크·마감·점검은 /workflowy:session-log 스킬로 하세요 (예: /workflowy:session-log doctor).",
+              file=sys.stderr)
+        sys.exit(1)
+    if mode == "doctor":
+        sys.exit(do_doctor())
 
-    if mode == "install":   sys.exit(do_install(sys.argv[2:]))
-    if mode == "uninstall": sys.exit(do_uninstall())
-    if mode == "doctor":    sys.exit(do_doctor())
+    try: ev = json.loads(sys.stdin.read() or "{}")
+    except Exception: ev = {}
+    sid = ev.get("session_id", "")
+    if mode == "pre-tool" and not step_of(ev) and ev.get("tool_name") not in ("Agent", "Task"):
+        sys.exit(0)                              # 모든 도구마다 불리므로 할 일이 없으면 잠금도 잡지 않는다
+    if mode == "refine":
+        do_refine(ev, sid)
+        sys.exit(0)
 
-    ev, text = {}, ""
-    if mode in ("note", "close", "link"):
-        sid  = sys.argv[2] if len(sys.argv) > 2 else ""
-        text = " ".join(sys.argv[3:])
-    else:
-        try: ev = json.loads(sys.stdin.read() or "{}")
-        except Exception: ev = {}
-        sid = ev.get("session_id", "")
-
+    say = None
     lk = lock(sid)
     try:
         st = load(sid)
-        if "turn_node" in st:                    # 1.0.x 상태 파일: 열린 턴을 새 형식으로 옮긴다
-            st.setdefault("turns", []).append({
-                "id": st.pop("turn_node"), "label": st.pop("turn_label", "턴"),
-                "key": "", "ts": st.pop("turn_started", time.time())})
-        for k in ("agents_wait", "agents_ended"):  # 1.4~1.5 의 SubagentStart/Stop 방식이 남긴 것
-            st.pop(k, None)
         if   mode == "session-start": h_start(ev, st, sid)
-        elif mode == "prompt":        h_prompt(ev, st, sid)
+        elif mode == "prompt":        say = h_prompt(ev, st, sid)
         elif mode == "stop":          h_stop(ev, st, sid)
         elif mode == "idle":          h_idle(ev, st, sid)
-        elif mode == "agent-launch":  h_agent_launch(ev, st, sid)
+        elif mode == "pre-tool":      h_pre_tool(ev, st, sid)
+        elif mode == "skill":         say = h_skill(ev, st, sid)
         elif mode == "session-end":   h_end(ev, st, sid)
-        elif mode == "note":          h_note(text, st, sid)
-        elif mode == "close":         h_end({"reason": "manual"}, st, sid)
-        elif mode == "link":          h_link(st, sid)
     except Exception as e:
-        ERRLOG.parent.mkdir(parents=True, exist_ok=True)
-        with ERRLOG.open("a", encoding="utf-8") as f:
-            f.write(f"{datetime.now():%F %T} [{mode}] {type(e).__name__}: {e}\n")
+        log_error(mode, e)
+        if mode == "skill" or (mode == "prompt" and SKILL.match((ev.get("prompt") or "").strip())):
+            say = f"[workflowy] 기록 실패: {type(e).__name__}: {e}"
     finally:
         if lk:
             lk.unlink(missing_ok=True)
+    if say and mode == "skill":                  # Claude 에게 결과를 돌려준다 (스킬 본문 뒤에 붙는다)
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse",
+                                                 "additionalContext": say}}, ensure_ascii=False))
+    elif say:                                    # UserPromptSubmit 의 stdout 은 Claude 의 컨텍스트가 된다
+        print(say)
     sys.exit(0)   # 훅은 무슨 일이 있어도 0. exit 2는 세션을 차단한다.
 
 

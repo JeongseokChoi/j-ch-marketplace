@@ -11,7 +11,9 @@
     ],
     "Stop": [
       { "hooks": [{ "type": "command", "timeout": 10,
-                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" stop" }] }
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" stop" },
+                  { "type": "command", "timeout": 150, "async": true,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" refine" }] }
     ],
     "Notification": [
       { "matcher": "idle_prompt",
@@ -19,9 +21,13 @@
                     "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" idle" }] }
     ],
     "PreToolUse": [
-      { "matcher": "Agent|Task",
-        "hooks": [{ "type": "command", "timeout": 15, "async": true,
-                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" agent-launch" }] }
+      { "hooks": [{ "type": "command", "timeout": 15, "async": true,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" pre-tool" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Skill",
+        "hooks": [{ "type": "command", "timeout": 15,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" skill" }] }
     ],
     "SessionEnd": [
       { "hooks": [{ "type": "command", "timeout": 10,
