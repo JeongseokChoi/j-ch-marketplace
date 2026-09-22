@@ -617,7 +617,7 @@ def digest(job):
         c = texts((r.get("message") or {}).get("content")) if r.get("type") == "user" else ""
         if c and job["key"] in norm(c):
             start = n; break
-    out, tools, said = [], 0, None
+    out, tools, said, memos = [], 0, None, set()
     for r in recs[start:]:
         content = (r.get("message") or {}).get("content")
         if r.get("type") == "assistant":
@@ -626,12 +626,15 @@ def digest(job):
                     said, final = len(out), b["text"]
                     out.append("(설명) " + scrub(b["text"], 400))
                 elif b.get("type") == "tool_use":
-                    tools += 1
                     i = b.get("input") or {}
+                    # session-log 호출은 ▸ 메모로 이미 남는다. 이름만 보이면 "세션 로그 조회" 같은 줄로 오해한다
+                    if b.get("name") == "Skill" and str(i.get("skill", "")).endswith("session-log"):
+                        memos.add(b.get("id")); continue
+                    tools += 1
                     out.append(f"(도구) {b.get('name')}: " + (norm(i.get("description")) or brief(i)))
         elif r.get("type") == "user" and not r.get("isMeta"):   # isMeta: 불러온 스킬 본문 등
             for b in content if isinstance(content, list) else []:
-                if isinstance(b, dict) and b.get("type") == "tool_result":
+                if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") not in memos:
                     res = texts(b.get("content")) or str(b.get("content") or "")
                     out.append("  -> " + scrub(norm(res), 300))
             c = texts(content)
@@ -642,6 +645,12 @@ def digest(job):
         out[said] = "[최종 응답]\n" + scrub(final, 2500, lines=True)
     text = "\n".join(out)
     return (text[:30000] + "\n…(생략)") if len(text) > 30000 else text, tools
+
+
+# digest 가 붙인 입력 표시. Haiku 가 "최종 응답: …" 처럼 줄 앞에 옮겨 적을 때가 있다.
+# 괄호로 감쌌거나 콜론이 붙은 것만 뗀다 ("요청 내용 확인" 같은 줄은 그대로 둔다).
+_TAGS = r"(?:최종 응답|요청|설명|도구|사용자|보고 도착)"
+TAG = re.compile(rf"^(?:[\[(]{_TAGS}[\])]\s*[:：]?|{_TAGS}\s*[:：])\s*")
 
 
 def summarize(text):
@@ -663,7 +672,7 @@ def summarize(text):
         timeout=100, cwd=str(STATE), env=env)
     if r.returncode:
         raise RuntimeError(f"claude -p 실패 ({r.returncode}): {norm(r.stderr or r.stdout)[:200]}")
-    lines = [LIST_ITEM.sub("", l).strip(" •·") for l in r.stdout.splitlines()]
+    lines = [TAG.sub("", LIST_ITEM.sub("", l).strip(" •·")) for l in r.stdout.splitlines()]
     # 프롬프트로 막아도 "… 작업 기록:" 같은 머리말이나 "## 제목" 이 붙어 나올 때가 있다
     return [l for l in lines if l and not l.endswith((":", "：")) and not l.startswith("#")][:40]
 
