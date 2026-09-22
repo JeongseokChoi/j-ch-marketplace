@@ -307,7 +307,7 @@ def h_start(ev, st, sid):
     root = conf("WORKFLOWY_ROOT_ID", "root_id")
     proj = pathlib.Path(ev.get("cwd") or ".").name
     why  = ev.get("session_start_reason") or ev.get("source") or "?"
-    nid  = node(root, f"## {proj} · {datetime.now():%Y-%m-%d %H:%M}",
+    nid  = node(root, f"{proj} · {datetime.now():%Y-%m-%d %H:%M}",
                 note=f"cwd: {ev.get('cwd')}\nsession: {sid}\nstart: {why}")
     tp = ev.get("transcript_path")                # resume 이면 이전 대화는 건너뛴다
     st.update(session_node=nid, started=time.time(),
@@ -453,7 +453,7 @@ def h_stop(ev, st, sid):
         else:
             close(t, None, st, now)              # 응답을 못 찾으면 요청 앞부분을 쓴다
     if titled and tp:
-        # 진행 중에 남긴 단계를 턴이 끝난 뒤 결과까지 담은 목록으로 바꾼다 (refine 훅이 비동기로 처리)
+        # 턴이 끝난 뒤 결과까지 담은 목록을 쓰고 진행 중에 남긴 단계는 한데 모은다 (refine 훅이 비동기로 처리)
         st.setdefault("refine", []).append({
             "turn": titled["id"], "key": titled["key"], "handback": titled.get("kind") == "handback",
             "steps": steps, "path": tp, "from": frm, "to": st["offset"]})
@@ -560,7 +560,7 @@ def h_skill(ev, st, sid):
 # ----------------------------------------------------------------- 진행 단계
 # 도구를 부를 때마다 Claude 가 붙이는 description 이 곧 "지금 하는 일" 이다.
 # 도구가 시작될 때(PreToolUse) 그 문구를 진행 중인 턴 아래에 단계로 붙이고,
-# 턴이 끝나면 refine 훅이 단계들을 결과까지 담은 명사형 목록으로 바꾼다.
+# 턴이 끝나면 refine 훅이 결과까지 담은 명사형 목록을 턴에 붙이고, 원본 단계는 "진행 단계" 아래로 옮긴다.
 
 
 def step_of(ev):
@@ -664,7 +664,8 @@ def summarize(text):
     if r.returncode:
         raise RuntimeError(f"claude -p 실패 ({r.returncode}): {norm(r.stderr or r.stdout)[:200]}")
     lines = [LIST_ITEM.sub("", l).strip(" •·") for l in r.stdout.splitlines()]
-    return [l for l in lines if l][:40]
+    # 프롬프트로 막아도 "… 작업 기록:" 같은 머리말이나 "## 제목" 이 붙어 나올 때가 있다
+    return [l for l in lines if l and not l.endswith((":", "：")) and not l.startswith("#")][:40]
 
 
 def refine_one(job):
@@ -674,12 +675,29 @@ def refine_one(job):
     lines = summarize(text)
     if not lines:
         return
-    for s in reversed(lines):                    # 맨 위부터 순서대로. 턴 중에 남긴 ▸ 메모는 그 아래에 남는다
-        node(job["turn"], label(s, 200), pos="top")
-    for nid in job["steps"]:
-        try: call("DELETE", f"/nodes/{nid}")
+    # 턴은 위에서 아래로 시간순으로 읽혀야 한다. 목록은 턴 중에 남긴 ▸ 메모 뒤에 차례로 붙이고,
+    # 원본 단계는 그 뒤의 "진행 단계" 로 옮긴다. 목록 안에서 메모의 자리는 알 수 없어 메모가 목록보다 먼저 온다.
+    for s in lines:
+        node(job["turn"], label(s, 200))
+    keep_steps(job["turn"], job["steps"])
+
+
+def keep_steps(turn, steps):
+    """원본 단계는 지우지 않고 턴 맨 아래의 "진행 단계" 노드 하나로 옮긴다. 정리된 목록과 섞이지 않고,
+    대기열 요청이나 합쳐진 턴 아래 붙었던 단계도 이 턴으로 돌아온다. 접힘 상태는 API 로 정할 수 없다."""
+    if not steps:
+        return
+    box, moved = node(turn, f"진행 단계 · {len(steps)}"), 0
+    for nid in steps:
+        try:
+            call("POST", f"/nodes/{nid}/move", {"parent_id": box, "position": "bottom"})
+            moved += 1
         except urllib.error.HTTPError as e:
-            if e.code != 404: raise
+            if e.code != 404: raise              # 사용자가 이미 지운 단계
+    if not moved:
+        call("DELETE", f"/nodes/{box}")
+    elif moved != len(steps):
+        edit(box, name=f"진행 단계 · {moved}")
 
 
 def do_refine(ev, sid):
