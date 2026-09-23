@@ -5,6 +5,7 @@ API key 는 플러그인 userConfig 에서 온다. MCP 서버에는 plugin.json 
 훅에는 Claude Code 가 CLAUDE_PLUGIN_OPTION_API_KEY 를 넘긴다. Claude 의 Bash 에는 둘 다 없다.
 """
 import json, os, re, time, urllib.request, urllib.error
+from datetime import datetime
 
 API = "https://workflowy.com/api/v1"
 
@@ -19,7 +20,7 @@ MD = re.compile(r"([*`\[\]])")
 # 화면에서 확인한 layoutMode. API 는 아무 문자열이나 저장하고, 모르는 값은 bullet 으로 그린다.
 # code-block 은 layoutMode 로 주면 첫 줄만 블록이 되고 나머지는 note 로 빠진다.
 # name 을 ``` 로 감싸면 여러 줄이 한 블록에 들어가고 layoutMode 도 code-block 이 된다.
-# 제목(h1·h2·h3)은 쓰지 않는다. 요청·주제는 굵은 bullets 로 쓴다.
+# 제목(h1·h2·h3)은 쓰지 않는다. 요청(request)은 굵은 bullets 로 서버가 만들고, 요청 안의 주제도 굵은 bullets.
 TYPES = ("bullets", "todo", "p", "quote-block", "code")
 
 # todo 를 닫는 방식과, 그 todo 아래에 쓰는 이유 노드의 머리말. hold 만 체크하지 않는다.
@@ -87,8 +88,24 @@ def get(nid):
     return call("GET", f"/nodes/{nid}")["node"]
 
 
-def create(parent, name, type="bullets", note=None):
-    """노드를 맨 아래에 만들고 전체 UUID 를 돌려준다. 순서가 곧 만든 순서가 되도록 position 은 받지 않는다."""
+def request_name(name):
+    """요청 노드의 제목: 전체를 굵게. 이미 전체가 굵으면 그대로 두고, 중간의 ** 는 걷어 내 굵게가 겹치지 않게 한다."""
+    s = str(name or "").strip()
+    if len(s) > 4 and s.startswith("**") and s.endswith("**") and "**" not in s[2:-2]:
+        return s
+    s = s.replace("**", "").strip()
+    return f"**{s}**" if s else ""
+
+
+def request_note(note):
+    """요청 노드의 note: 첫 줄에 날짜·시각. 세션의 경계를 알아보는 표시다."""
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return stamp + ("\n" + note if note else "")
+
+
+def create(parent, name, type="bullets", note=None, request=False):
+    """노드를 맨 아래에 만들고 전체 UUID 를 돌려준다. 순서가 곧 만든 순서가 되도록 position 은 받지 않는다.
+    request 면 요청 노드로 만든다: 제목은 굵게, note 첫 줄에 날짜·시각."""
     if type not in TYPES:
         raise ValueError(f"지원하지 않는 type: {type} (가능: {', '.join(TYPES)})")
     name = str(name or "").replace("\r\n", "\n").strip("\n")
@@ -102,6 +119,10 @@ def create(parent, name, type="bullets", note=None):
         # 여러 줄 name 은 Workflowy 가 첫 줄만 name 으로 두고 나머지를 note 로 옮긴다. 그 동작을 직접 한다.
         first, _, rest = name.partition("\n")
         name, note = first.strip(), "\n\n".join(x for x in (rest.strip("\n"), note) if x)
+        if request:
+            name, note = request_name(name), request_note(note)
+            if not name:
+                raise ValueError("name 이 비어 있음")
         b["name"] = scrub(name, 1000)
         b["layoutMode"] = type
     if note:

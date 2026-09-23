@@ -9,7 +9,7 @@ mcp.py - Claude 가 Workflowy 작업 로그를 직접 쓰는 MCP 서버 (stdio, 
 import json, sys, urllib.error
 import wfapi
 
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 
 INSTRUCTIONS = (
     "사용자가 /workflowy:workstream <id> 로 기록을 시작한 세션에서만 쓴다. "
@@ -20,7 +20,10 @@ TOOLS = [
      "description": (
          "Workflowy 노드를 parent 의 맨 아래에 추가하고 id 와 url 을 돌려준다. "
          "parent 는 기록 root 이거나 이 세션에서 만들었거나 이어받은 노드여야 한다. "
-         "type: bullets(일반 항목. 요청·주제는 **굵게**) | todo(체크할 작업, 끝나거나 멈추면 close) | "
+         "root 바로 아래에는 요청만 쓴다: 새 요청은 parent=root, request=true 로 만든다(제목은 굵게, note 첫 줄에 날짜·시각이 "
+         "자동으로 붙는다). 요청 안에 쓸 노드는 parent 를 그 요청이나 하위 노드로 준다. "
+         "방금 만든 노드 아래에 쓸 노드는 그 id 를 받은 뒤에 부른다. "
+         "type: bullets(일반 항목. 요청 안의 큰 주제는 **굵게**) | todo(체크할 작업, 끝나거나 멈추면 close) | "
          "p(단락) | quote-block(인용) | code(코드·명령·로그, name 에 코드 원문). "
          "name 은 마크다운(**굵게**, `코드`, [링크](url))을 쓸 수 있다. "
          "code 가 아닌 type 에서 여러 줄 name 은 첫 줄만 제목이 되고 나머지는 note 로 간다. "
@@ -35,7 +38,10 @@ TOOLS = [
              "steps": {"type": "boolean",
                        "description": "todo 는 기본 true: 완료되기 전까지 이후 도구 실행이 이 노드 아래에 자동으로 붙는다. "
                                       "'나중에 확인' 처럼 지금 하는 작업이 아닌 todo 는 false. "
-                                      "todo 가 아닌 노드에 true 를 주면 열린 todo 가 없을 때 도구 실행이 여기에 붙는다."}},
+                                      "todo 가 아닌 노드에 true 를 주면 열린 todo 가 없을 때 도구 실행이 여기에 붙는다."},
+             "request": {"type": "boolean",
+                         "description": "root 바로 아래에 새 요청을 만들 때만 true (type 은 bullets). "
+                                        "제목은 굵게, note 첫 줄에 날짜·시각이 자동으로 붙으니 직접 쓰지 않는다."}},
          "required": ["parent", "name"]}},
     {"name": "close",
      "description": (
@@ -59,7 +65,8 @@ TOOLS = [
 
 def run(name, args):
     if name == "create":
-        nid = wfapi.create(args.get("parent"), args.get("name"), args.get("type") or "bullets", args.get("note"))
+        nid = wfapi.create(args.get("parent"), args.get("name"), args.get("type") or "bullets", args.get("note"),
+                           request=args.get("request") is True)
         return f"id: {nid}\nurl: {wfapi.url(nid)}"
     if name == "close":
         return close(wfapi.ids_of(args.get("ids")), args.get("outcome") or "done", str(args.get("reason") or "").strip())

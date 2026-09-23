@@ -139,10 +139,24 @@ def focus(st):
     f = walk(short(st.get("root")))
     if f:
         return f
-    root = short(st.get("root"))
     rest = [n for n in st.get("nodes") or [] if n["type"] != "todo" and not n.get("old")
-            and (n.get("steps") is True or (n["parent"] == root and n.get("steps") is not False))]
+            and (n.get("steps") is True or (is_request(st, n) and n.get("steps") is not False))]
     return rest[-1] if rest else None
+
+
+def is_request(st, n):
+    """요청 노드인가. 3.3 부터는 request=true 로 만든 노드. 그 전 기록은 root 바로 아래의 bullets·h1~h3 을 요청으로 본다
+    (root 바로 아래의 p 같은, 잘못 들어간 노드는 요청이 아니다)."""
+    if "request" in n:
+        return bool(n["request"])
+    return n["parent"] == short(st.get("root")) and n["type"] in ("bullets", "h1", "h2", "h3")
+
+
+def last_request(st):
+    """거부 안내에 보여 줄 지금 요청: 이 세션이 만든 마지막 요청, 없으면 이어받은 마지막 요청."""
+    rs = [n for n in st.get("nodes") or [] if is_request(st, n)]
+    mine = [n for n in rs if not n.get("old")]
+    return (mine or rs or [None])[-1]
 
 
 def find(st, nid):
@@ -218,7 +232,8 @@ def summary(st):
 
 
 REMIND = ("[workflowy] 이 세션은 Workflowy 에 기록 중이다. 이 요청도 진행하는 대로 root 아래에 정리해 쓴다 "
-          "(단계는 todo, 단계의 발견·결과는 그 todo 아래에 쓰고 close. 하지 않은 todo 는 done 으로 닫지 않는다). "
+          "(새 요청은 root 아래에 request: true, 단계는 todo, 단계의 발견·결과는 그 todo 아래에 쓰고 close. "
+          "하지 않은 todo 는 done 으로 닫지 않는다). "
           "도구 description 은 사용자의 언어로, 명사형으로 짧게 쓴다 — 그대로 기록된다.")
 
 
@@ -260,7 +275,8 @@ def h_prompt(ev, st, sid, arg):
               started=time.time(), cwd=ev.get("cwd"), nodes=old)
     save(sid, st)
     out = (f"[workflowy] 기록 시작: '{st['root_name']}' {wfapi.url(n['id'])}\n"
-           f"root id: {s} — 이 노드 자체는 건드리지 않고, 그 아래에 workflowy create 도구로 쓴다.")
+           f"root id: {s} — 이 노드 자체는 건드리지 않고, 그 아래에 workflowy create 도구로 쓴다. "
+           "root 바로 아래에는 요청만 쓴다: 새 요청은 create(parent=root, request: true).")
     if prev:
         out += f"\n(이전에 기록하던 '{prev}' 대신 이 노드에 기록한다. 이전 노드들은 parent 로 쓸 수 없다.)"
     if old:
@@ -296,14 +312,28 @@ def h_guard(ev, st):
         return decide(False, "이 세션은 Workflowy 에 기록 중이 아니다. 사용자가 /workflowy:workstream <id> 로 시작해야 쓸 수 있다.")
     i, tool = ev.get("tool_input") or {}, ev.get("tool_name", "")[len(TOOL):]
     if tool == "create":
-        p = short(i.get("parent"))
-        if p and (p == short(st["root"]) or find(st, p)):
-            return decide(True)
-        return decide(False, f"parent 는 기록 root({short(st['root'])}) 이거나 이 세션에서 만들었거나 이어받은 노드여야 한다. "
-                             "지금까지 쓴 노드:\n" + tree(st, 30))
+        return decide(*check_create(st, i))
     if tool == "close":
         return decide(*check_close(st, i))
     return decide(False, f"알 수 없는 workflowy 도구: {tool}")
+
+
+def check_create(st, i):
+    """(허용 여부, 거부 이유). root 바로 아래에는 request=true 로 밝힌 요청만 들어간다."""
+    p, root, req = short(i.get("parent")), short(st["root"]), i.get("request") is True
+    if not (p and (p == root or find(st, p))):
+        return False, (f"parent 는 기록 root({root}) 이거나 이 세션에서 만들었거나 이어받은 노드여야 한다. "
+                       "지금까지 쓴 노드:\n" + tree(st, 30))
+    if p == root and not req:
+        r = last_request(st)
+        return False, ("root 바로 아래에는 요청만 쓴다. 새 요청이면 request: true 로 만들고, "
+                       "요청 안에 쓸 내용이면 parent 를 그 요청(이나 하위 노드)으로 준다."
+                       + (f" 지금 요청: '{r['name']}' (id: {short(r['id'])})" if r else ""))
+    if req and p != root:
+        return False, f"요청(request: true)은 root({root}) 바로 아래에만 만든다. 요청 안의 주제는 굵은 bullets 로 쓴다."
+    if req and (i.get("type") or "bullets") != "bullets":
+        return False, "요청은 bullets 로 만든다 (굵게와 날짜·시각 note 는 서버가 붙인다)."
+    return True, ""
 
 
 def check_close(st, i):
@@ -359,10 +389,12 @@ def h_track(ev, st, sid):
         m = ID.search(r)
         if not m:
             return                               # 실패한 호출
-        t = i.get("type") or "bullets"
-        name = norm(str(i.get("name") or "").split("\n")[0]) if t != "code" else "(코드)"
+        t, req = i.get("type") or "bullets", i.get("request") is True
+        name = norm(str(i.get("name") or "").strip("\n").split("\n")[0]) if t != "code" else "(코드)"
+        name = wfapi.request_name(name) if req else name       # 서버가 붙인 굵게까지 실제 제목과 같게
         st["nodes"].append({"id": m.group(1), "parent": short(i.get("parent")), "type": t, "t": time.time(),
-                            "name": clip(name), **({"steps": bool(i["steps"])} if "steps" in i else {})})
+                            "name": clip(name), **({"steps": bool(i["steps"])} if "steps" in i else {}),
+                            **({"request": True} if req else {})})
     elif tool == "close":
         outcome = i.get("outcome") or "done"
         name = clip(norm(wfapi.close_note(outcome, str(i.get("reason") or "").strip()).split("\n")[0]))
@@ -418,7 +450,8 @@ def h_session_start(ev, st):
     if not st.get("root"):
         return None
     return ("[workflowy] 이 세션은 Workflowy 에 작업 기록 중이다 (/workflowy:workstream 스킬의 지침을 계속 따른다).\n"
-            "- 지금 하는 작업은 workflowy create 도구로 root 아래에 정리해 쓰고, todo 는 끝나는 대로 close 한다 "
+            "- 지금 하는 작업은 workflowy create 도구로 root 아래에 정리해 쓰고 (새 요청은 request: true), "
+            "todo 는 끝나는 대로 close 한다 "
             "(끝냄 done · 안 함 cancel · 방법 바뀜 replace · 미룸 hold).\n"
             "- 도구 실행은 훅이 열린 todo 아래에 자동으로 붙인다. 도구의 description 은 명사형으로 짧게 쓴다.\n"
             "- 이미 쓴 노드는 고치거나 지우지 않고, 새 노드를 추가만 한다.\n" + summary(st))
