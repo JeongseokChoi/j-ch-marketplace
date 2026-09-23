@@ -24,7 +24,6 @@ TOOL   = "mcp__plugin_workflowy_workflowy__"          # 플러그인 MCP 서버 
 # Claude Code 가 스스로 넣는 턴(에이전트 보고, 완료 알림 등). source 필드가 없는 버전은 내용으로 판단한다.
 SYSTEM = re.compile(r"\s*(<(agent-message|task-notification|system-reminder|local-command-caveat)\b"
                     r"|Another Claude session sent a message:|\[SYSTEM NOTIFICATION)")
-HEADS  = ("h1", "h2", "h3")
 
 # ----------------------------------------------------------------- 상태
 
@@ -107,8 +106,8 @@ def kids(st):
 def focus(st):
     """도구 실행을 붙일 노드. 트리 순서로 첫 번째 열린 todo 에서 시작해 그 아래 열린 todo 로 끝까지 내려간다.
     Phase 를 한꺼번에 만들어 두어도 지금 하는 Phase(그 안의 지금 하는 작업)에 붙는다.
-    열린 todo 가 없으면 steps=true 로 만든 노드나 제목 중 마지막 것.
-    이어받은 노드는 고르지 않는다. 새 요청 제목을 만들기 전의 도구 실행이 이전 세션의 기록에 섞이지 않게 한다.
+    열린 todo 가 없으면 steps=true 로 만든 노드나 root 바로 아래 노드(요청) 중 마지막 것.
+    이어받은 노드는 고르지 않는다. 새 요청을 만들기 전의 도구 실행이 이전 세션의 기록에 섞이지 않게 한다.
     이어받은 열린 todo 의 아래에 이 세션이 만든 todo 는 고른다."""
     ch = kids(st)
 
@@ -129,8 +128,9 @@ def focus(st):
     f = walk(short(st.get("root")))
     if f:
         return f
+    root = short(st.get("root"))
     rest = [n for n in st.get("nodes") or [] if n["type"] != "todo" and not n.get("old")
-            and (n.get("steps") is True or (n["type"] in HEADS and n.get("steps") is not False))]
+            and (n.get("steps") is True or (n["parent"] == root and n.get("steps") is not False))]
     return rest[-1] if rest else None
 
 

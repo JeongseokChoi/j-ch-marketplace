@@ -19,7 +19,8 @@ MD = re.compile(r"([*`\[\]])")
 # 화면에서 확인한 layoutMode. API 는 아무 문자열이나 저장하고, 모르는 값은 bullet 으로 그린다.
 # code-block 은 layoutMode 로 주면 첫 줄만 블록이 되고 나머지는 note 로 빠진다.
 # name 을 ``` 로 감싸면 여러 줄이 한 블록에 들어가고 layoutMode 도 code-block 이 된다.
-TYPES = ("bullets", "todo", "h1", "h2", "h3", "p", "quote-block", "code")
+# 제목(h1·h2·h3)은 쓰지 않는다. 요청·주제는 굵은 bullets 로 쓴다.
+TYPES = ("bullets", "todo", "p", "quote-block", "code")
 
 SHORT = re.compile(r"(?:#/)?([0-9a-f]{12})/?$")   # URL 끝, short id, 전체 UUID 모두 끝 12자리가 같다
 
