@@ -1,37 +1,25 @@
 {
   "hooks": {
     "SessionStart": [
-      { "matcher": "startup|resume|clear",
-        "hooks": [{ "type": "command", "timeout": 15,
+      { "matcher": "resume|compact",
+        "hooks": [{ "type": "command", "timeout": 10,
                     "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" session-start" }] }
     ],
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "timeout": 10,
+      { "hooks": [{ "type": "command", "timeout": 15,
                     "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" prompt" }] }
     ],
-    "Stop": [
-      { "hooks": [{ "type": "command", "timeout": 10,
-                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" stop" },
-                  { "type": "command", "timeout": 150, "async": true,
-                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" refine" }] }
-    ],
-    "Notification": [
-      { "matcher": "idle_prompt",
-        "hooks": [{ "type": "command", "timeout": 15, "async": true,
-                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" idle" }] }
-    ],
     "PreToolUse": [
+      { "matcher": "mcp__plugin_workflowy_workflowy__.*",
+        "hooks": [{ "type": "command", "timeout": 10,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" guard" }] },
       { "hooks": [{ "type": "command", "timeout": 15, "async": true,
-                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" pre-tool" }] }
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" step" }] }
     ],
     "PostToolUse": [
-      { "matcher": "Skill",
-        "hooks": [{ "type": "command", "timeout": 15,
-                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" skill" }] }
-    ],
-    "SessionEnd": [
-      { "hooks": [{ "type": "command", "timeout": 10,
-                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" session-end" }] }
+      { "matcher": "mcp__plugin_workflowy_workflowy__.*",
+        "hooks": [{ "type": "command", "timeout": 10,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" track" }] }
     ]
   }
 }
