@@ -360,10 +360,10 @@ def new_errors():
     try:
         size = ERRLOG.stat().st_size
         done = int(seen.read_text()) if seen.exists() else 0
-        if size <= done:
-            return []
+        if size < done:                          # 로그를 비웠거나 줄였으면 처음부터 읽는다
+            done = 0
         with ERRLOG.open("rb") as f:
-            f.seek(done if done <= size else 0)
+            f.seek(done)
             lines = f.read().decode("utf-8", "replace").strip().splitlines()
         seen.write_text(str(size))
         return lines

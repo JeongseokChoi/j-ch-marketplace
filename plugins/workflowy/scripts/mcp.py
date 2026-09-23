@@ -9,7 +9,7 @@ mcp.py - Claude 가 Workflowy 작업 로그를 직접 쓰는 MCP 서버 (stdio, 
 import json, sys, urllib.error
 import wfapi
 
-VERSION = "3.1.0"
+VERSION = "3.1.1"
 
 INSTRUCTIONS = (
     "사용자가 /workflowy:workstream <id> 로 기록을 시작한 세션에서만 쓴다. "
