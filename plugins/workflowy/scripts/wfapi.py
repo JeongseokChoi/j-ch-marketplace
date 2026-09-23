@@ -245,7 +245,7 @@ def subtree(root, limit=20.0, workers=8, progress=None):
     멈추고 BACKOFF 만큼 기다렸다 다시 부른다 (patient). 훅·doctor(limit 있음)는 call 의 짧은 재시도 그대로다.
     progress(노드 수, 호출 수, 한도 대기 횟수) 는 2초에 한 번쯤 불린다.
     그 노드 수는 ▹ 도구 실행을 뺀 수다 — 이어받는 트리(from_api)가 ▹ 를 넣지 않으므로, sync 가 끝난 뒤 알리는 수와 맞춘다.
-    root 의 자식을 읽지 못하면 예외를 그대로 올린다 (호출한 쪽이 로컬 기록으로 대체한다).
+    root 의 자식을 읽지 못하면 예외를 그대로 올린다 (호출한 쪽이 cache 로 대신한다).
     돌려주는 값: nodes(API 노드. 트리 순서가 아니다), missing(자식을 읽지 못한 노드 id), times(성공한 호출별 초),
     errors(실패한 호출 수), reasons(실패 이유별 횟수), waits(한도로 멈춘 횟수), seconds(전체 초).
     스레드는 daemon 으로 직접 띄운다. ThreadPoolExecutor 는 프로세스가 끝날 때 한도를 넘긴 호출까지 기다린다."""

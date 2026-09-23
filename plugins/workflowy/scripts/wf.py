@@ -2,13 +2,16 @@
 """
 wf.py - workflowy 플러그인의 훅. 기록 내용은 Claude 가 MCP 도구(mcp.py)로 직접 쓰고, 훅은 그 주변을 맡는다.
 
-  prompt         UserPromptSubmit  /workflowy:workstream <id> | sync | stop | doctor | (없음: 상태)
+  prompt         UserPromptSubmit  /workflowy:workstream <id> | sync | clear-cache | stop | doctor | (없음: 상태)
   guard          PreToolUse        workflowy 도구 호출 검사 — root 아래, 이 세션이 만들었거나 이어받은 노드만 허용
-  track          PostToolUse       workflowy 도구가 만든 노드와 닫은 todo 를 세션 상태에 기록
+  track          PostToolUse       workflowy 도구가 만든 노드와 닫은 todo 를 state 에 기록
   step           PreToolUse        그 밖의 도구 실행을 지금 작업 중인 노드 아래에 자동으로 붙인다
   session-start  SessionStart      resume/compact 뒤 기록 중이라는 사실과 노드 구조를 다시 알려준다
 
-API key 와 상태 저장 위치는 훅 프로세스에만 넘어온다(CLAUDE_PLUGIN_OPTION_*, CLAUDE_PLUGIN_DATA).
+state  세션 하나의 기록 상태 (state/<session id>.json): 기록 중인 root, 이 세션의 노드(이어받은 것과 만든 것).
+cache  root 하나의 트리를 이 PC 가 아는 사본 (cache/<root>.json): sync 로 받은 트리와 받은 시각. 세션들이 함께 쓴다.
+
+API key 와 데이터 폴더 위치는 훅 프로세스에만 넘어온다(CLAUDE_PLUGIN_OPTION_*, CLAUDE_PLUGIN_DATA).
 """
 import io, json, os, re, sys, time, pathlib, urllib.error
 from contextlib import redirect_stdout
@@ -17,8 +20,8 @@ import wfapi
 from wfapi import short
 
 DATA   = os.environ.get("CLAUDE_PLUGIN_DATA")
-STATE  = pathlib.Path(DATA) if DATA else None       # 업데이트에도 보존되는 플러그인 데이터 영역
-ERRLOG = STATE / "error.log" if STATE else None
+DATA_DIR = pathlib.Path(DATA) if DATA else None    # 업데이트에도 보존되는 플러그인 데이터 폴더 (state/ cache/ sync/)
+ERRLOG = DATA_DIR / "error.log" if DATA_DIR else None
 SKILL  = re.compile(r"^/(?:workflowy:)?workstream\b\s*(.*)$", re.S)    # 사용자가 직접 입력한 스킬
 TOOL   = "mcp__plugin_workflowy_workflowy__"          # 플러그인 MCP 서버 도구 이름의 접두사
 LIMIT  = 20       # doctor 가 트리 읽기를 잴 때의 시간 한도(초). prompt 훅 timeout(hooks.json, 30초) 안에 끝나야 한다
@@ -26,10 +29,10 @@ LIMIT  = 20       # doctor 가 트리 읽기를 잴 때의 시간 한도(초). p
 SYSTEM = re.compile(r"\s*(<(agent-message|task-notification|system-reminder|local-command-caveat)\b"
                     r"|Another Claude session sent a message:|\[SYSTEM NOTIFICATION)")
 
-# ----------------------------------------------------------------- 상태
+# ----------------------------------------------------------------- state
 
 
-def spath(sid): return STATE / "state" / f"{sid}.json"
+def spath(sid): return DATA_DIR / "state" / f"{sid}.json"
 
 def load(sid):
     try:    return json.loads(spath(sid).read_text(encoding="utf-8"))
@@ -40,9 +43,28 @@ def save(sid, st):
     p.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
 
 
+def put(p, obj):
+    """파일을 통째로 바꾼다 (읽는 쪽이 반쯤 쓴 파일을 보지 않게). Windows 는 읽는 중이면 바꾸기가 실패해 몇 번 다시 한다."""
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+    for _ in range(50):
+        try:
+            os.replace(tmp, p)
+            return True
+        except PermissionError:
+            time.sleep(0.05)
+    tmp.unlink(missing_ok=True)
+    return False
+
+
 def lock(sid):
-    """훅이 동시에 돌 때 상태 파일을 지킨다. 못 잡으면 None."""
-    p = spath(sid).with_suffix(".lock"); p.parent.mkdir(parents=True, exist_ok=True)
+    """훅이 동시에 돌 때 state 를 지킨다. 못 잡으면 None."""
+    return lock_file(spath(sid).with_suffix(".lock"))
+
+
+def lock_file(p):
+    p.parent.mkdir(parents=True, exist_ok=True)
     for _ in range(200):                         # 최대 약 10초
         try:
             os.close(os.open(p, os.O_CREAT | os.O_EXCL))
@@ -58,7 +80,7 @@ def lock(sid):
 
 
 def archive(sid, st):
-    """상태 파일을 지우지 않고 <sid>.<시각>.json 으로 남긴다. 나중에 같은 root 로 시작한 세션이 이어받는다."""
+    """state 를 지우지 않고 <sid>.<시각>.json 으로 남긴다. 나중에 같은 root 로 시작한 세션이 이 세션이 쓴 것을 이어받는다."""
     p = spath(sid)
     if st.get("nodes"):
         p.replace(p.with_name(f"{sid}.{int(time.time() * 1000)}.json"))
@@ -66,21 +88,25 @@ def archive(sid, st):
         p.unlink(missing_ok=True)
 
 
-def inherit(sid, root):
-    """이 PC 의 다른 세션들(멈춘 세션 포함)이 같은 root 에 쓴 노드와 그 세션 수. Workflowy 트리를 읽지 못할 때 대신 쓰고,
-    읽었을 때도 Workflowy 에 없는 steps 와 시간 한도로 못 읽은 하위를 여기서 채운다 (sync, from_api).
-    create 는 늘 맨 아래에 붙이므로 만든 시각 순이 곧 문서 순서다. 시각이 없는 노드는 그 세션의 시작 시각으로 본다.
-    이어받은 세션도 그 노드를 갖고 있으므로 한 노드가 여러 파일에 있을 수 있다.
-    어느 쪽이든 닫았으면 닫힌 것, 그렇지 않고 어느 쪽이든 보류했으면 보류."""
-    got, sids = [], set()
-    for p in (STATE / "state").glob("*.json"):
+def states(sid, root):
+    """이 PC 의 다른 세션들(멈춘 세션 포함) 가운데 같은 root 에 기록한 state."""
+    for p in (DATA_DIR / "state").glob("*.json"):
         if p == spath(sid):
             continue
         try:    o = json.loads(p.read_text(encoding="utf-8"))
         except Exception: continue
-        if short(o.get("root")) != short(root) or not o.get("nodes"):
-            continue
-        sids.add(p.name.split(".")[0])
+        if short(o.get("root")) == short(root) and o.get("nodes"):
+            yield o
+
+
+def from_states(sid, root):
+    """3.4 까지의 이어받기: 이 PC 의 다른 세션들의 state 를 이어받은 노드까지 모두 합친다.
+    cache 가 없을 때(이 PC 에서 아직 sync 하지 않은 root)만 쓴다. 끝난 세션의 낡은 사본도 섞인다.
+    create 는 늘 맨 아래에 붙이므로 만든 시각 순이 곧 문서 순서다. 시각이 없는 노드는 그 세션의 시작 시각으로 본다.
+    이어받은 세션도 그 노드를 갖고 있으므로 한 노드가 여러 파일에 있을 수 있다.
+    어느 쪽이든 닫았으면 닫힌 것, 그렇지 않고 어느 쪽이든 보류했으면 보류."""
+    got = []
+    for o in states(sid, root):
         t0 = o.get("started") or 0
         got += [(n.get("t", t0), t0, i, n) for i, n in enumerate(o["nodes"])]
     out, seen = [], {}
@@ -95,7 +121,96 @@ def inherit(sid, root):
             continue
         seen[k] = dict(n, t=t, old=True)
         out.append(seen[k])
-    return out, len(sids)
+    return out
+
+# ----------------------------------------------------------------- cache
+# cache 는 root 하나의 트리를 이 PC 가 아는 사본이다: sync 로 Workflowy 에서 받은 트리(nodes)와 받은 시각(since).
+# root 마다 파일 하나를 이 PC 의 세션들이 함께 쓴다. 쓰는 것은 sync(통째로 교체)와 clear-cache(비움)뿐이다.
+# 받은 뒤에 세션들이 쓴 노드와 닫은 todo 는 각 state 에 있으므로 이어받을 때 더한다 (from_cache).
+# 원본은 Workflowy 라 언제든 비우고 다시 받을 수 있다. 다만 sync 는 옛 cache 에서 steps(Workflowy 에 없음)와
+# 못 읽은 하위를 이어 오므로, 잘못 들어간 값은 clear-cache 로만 끊을 수 있다.
+
+
+def cpath(root): return DATA_DIR / "cache" / f"{short(root)}.json"
+
+
+def load_cache(root):
+    """(cache, 알릴 글). 파일이 없으면 None — 이 PC 에서 이 root 를 sync 한 적이 없다.
+    깨졌으면 비운 것으로 본다 (받은 시각은 파일을 쓴 시각)."""
+    p = cpath(root)
+    try:
+        c = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(c, dict) or not isinstance(c.get("nodes"), list):
+            raise ValueError("nodes 가 없다")
+        return c, None
+    except FileNotFoundError:
+        return None, None
+    except Exception as e:
+        try:    since = p.stat().st_mtime
+        except OSError: since = time.time()
+        return ({"root": root, "since": since, "by": "broken", "nodes": []},
+                f"cache 파일이 깨져 비운 것으로 봤다({type(e).__name__}). "
+                "하위가 필요하면 사용자에게 /workflowy:workstream sync 를 권한다.")
+
+
+def save_cache(root, c, newer_than=None):
+    """cache 를 통째로 바꾼다. newer_than 을 주면, 그보다 나중에 받거나 비운 cache 가 이미 있을 때 두고 False.
+    파일을 바꾸지 못하면 OSError."""
+    lk = lock_file(cpath(root).with_suffix(".lock"))
+    try:
+        if newer_than is not None:
+            cur, broken = load_cache(root)
+            if cur and not broken and (cur.get("since") or 0) > newer_than:
+                return False
+        if not put(cpath(root), c):
+            raise OSError("cache 파일을 바꾸지 못했다 (다른 프로세스가 읽는 중)")
+        return True
+    finally:
+        if lk:
+            lk.unlink(missing_ok=True)
+
+
+def cache_age(c):
+    """cache 를 언제 받았는지(비웠는지) 한 마디."""
+    if c is None:
+        return "cache 없음"
+    when = f"{datetime.fromtimestamp(c.get('since') or 0):%m-%d %H:%M}"
+    return {"sync": f"마지막 sync {when}", "clear-cache": f"{when} 에 비움"}.get(
+        c.get("by"), f"깨진 파일이라 비운 것으로 봄 ({when})")
+
+
+def from_cache(sid, root):
+    """(이어받을 노드, cache, 알릴 글). cache 에, 받은(비운) 뒤 이 PC 의 다른 세션들이 쓴 것을 더한다:
+    그 뒤에 만든 노드와 그 뒤에 닫은 todo. 세션들이 이어받은 노드(old)는 읽지 않는다 — cache 보다 낡은 사본이다.
+    cache 가 없으면 3.4 까지처럼 state 들을 모두 합친다 (from_states)."""
+    c, warn = load_cache(root)
+    if c is None:
+        return from_states(sid, root), None, warn
+    out = [dict(n, old=True) for n in c["nodes"]]
+    byid = {short(n["id"]): n for n in out}
+    since, new, closed = c.get("since") or 0, [], []
+    for o in states(sid, root):
+        t0 = o.get("started") or 0
+        for n in o["nodes"]:
+            if not n.get("old") and n.get("t", t0) >= since:
+                new.append((n.get("t", t0), n))
+            if (n.get("done") or n.get("held")) and n.get("ct", 0) >= since:
+                closed.append(n)
+    for _, n in sorted(new, key=lambda x: x[0]):          # 만든 순서 = 문서 순서
+        k = short(n["id"])
+        if k not in byid:                                 # sync 가 읽기 전에 만들어 이미 cache 에 있으면 그대로
+            byid[k] = dict(n, old=True)
+            out.append(byid[k])
+    for n in sorted(closed, key=lambda n: n["ct"]):
+        x = byid.get(short(n["id"]))
+        if not x or x.get("done"):
+            continue
+        if n.get("done"):
+            x.update(done=True, **({"outcome": n["outcome"]} if n.get("outcome") else {}))
+            x.pop("held", None)
+        else:
+            x["held"] = True
+    return out, c, warn
 
 
 MODES  = ("bullets", "todo", "p", "quote-block", "h1", "h2", "h3")   # 그대로 받는 layoutMode (code-block 은 code)
@@ -109,18 +224,18 @@ def reason_of(name):
     return REASON[m.group(1)] if m else None
 
 
-def from_api(root, t, local, mark=True):
-    """Workflowy 에서 읽은 트리(wfapi.subtree)를 이어받을 상태 노드 목록으로. priority 순 DFS 로 둔다 —
+def from_api(root, t, cached, mark=True):
+    """Workflowy 에서 읽은 트리(wfapi.subtree)를 이어받을 노드 목록으로. priority 순 DFS 로 둔다 —
     kids() 가 목록 순서를 문서 순서로 본다. ▹ 도구 실행 노드는 넣지 않는다.
-    Workflowy 에 없는 steps 는 로컬 기록(local)에서 가져오고, 닫은 방식·보류는 close 가 쓴 이유 노드로 되살린다.
-    하위를 읽지 못한 노드(t["missing"])는 그 아래를 로컬 기록으로 채우고, mark 면 partial 로 표시한다."""
+    Workflowy 에 없는 steps 는 cache 에서(cached, from_cache) 가져오고, 닫은 방식·보류는 close 가 쓴 이유 노드로 되살린다.
+    하위를 읽지 못한 노드(t["missing"])는 그 아래를 cache 로 채우고, mark 면 partial 로 표시한다."""
     ch = {}
     for n in t["nodes"]:
         n["_name"] = norm(wfapi.unhtml(n.get("name")))
         ch.setdefault(short(n.get("parent_id")), []).append(n)
     for v in ch.values():
         v.sort(key=lambda n: n.get("priority") or 0)
-    mine, lk, top = {short(n["id"]): n for n in local}, kids({"nodes": local}), short(root)
+    mine, lk, top = {short(n["id"]): n for n in cached}, kids({"nodes": cached}), short(root)
     missing, out = {short(x) for x in t["missing"]}, []
 
     def conv(n, parent):
@@ -166,9 +281,9 @@ def from_api(root, t, local, mark=True):
     return out
 
 
-def read(root, local, full, progress=None):
+def read(root, cached, full, progress=None):
     """Workflowy 에서 읽어 이어받을 노드와 Claude 에게 알릴 한 줄. 읽지 못하면 노드 대신 None.
-    full 이면 root 아래 전체를 끝까지(백그라운드 sync), 아니면 root 의 자식(요청 목록)만 읽고 하위는 로컬 기록(local)으로
+    full 이면 root 아래 전체를 끝까지(백그라운드 sync), 아니면 root 의 자식(요청 목록)만 읽고 하위는 cache(cached)로
     채운다(기록 시작). 전체는 노드마다 호출하므로 오래 걸린다 — 그래서 시작은 가볍게, 전체는 훅 밖에서 읽는다."""
     try:
         if full:
@@ -178,7 +293,7 @@ def read(root, local, full, progress=None):
             t = {"nodes": top, "missing": [n["id"] for n in top], "errors": 0}
     except Exception as e:
         return None, f"Workflowy 에서 {'트리를' if full else '요청 목록을'} 읽지 못했다({wfapi.why(e)})."
-    nodes = from_api(root, t, local, mark=full)
+    nodes = from_api(root, t, cached, mark=full)
     part = [n for n in nodes if n.get("partial")]
     if not part:
         return nodes, None
@@ -186,7 +301,7 @@ def read(root, local, full, progress=None):
     names = ", ".join(f"'{n['name']}' ({short(n['id'])})" for n in part[:10])
     reasons = ", ".join(f"{k} {v}번" for k, v in sorted((t.get("reasons") or {}).items(), key=lambda x: -x[1]))
     return nodes, (f"호출 실패({t['errors']}번{': ' + reasons if reasons else ''})로 {len(part)}개 노드의 하위를 "
-                   f"읽지 못해 이 PC 기록으로 채웠다: {names}"
+                   f"읽지 못해 cache 로 채웠다: {names}"
                    + (f" 외 {len(part) - 10}개" if len(part) > 10 else "") + ".")
 
 
@@ -203,12 +318,12 @@ def pending(nodes):
 
 # ----------------------------------------------------------------- sync (백그라운드)
 # /workflowy:workstream sync 는 훅 timeout 에 묶이지 않도록 훅이 분리된 프로세스(wf.py sync-run)를 띄우고 곧바로 끝난다.
-# 그 프로세스가 끝까지 읽고, 잠금을 잠깐 잡아 세션 상태에 합친 뒤 결과를 작업 파일에 남긴다.
+# 그 프로세스가 끝까지 읽어 cache 를 통째로 바꾸고, 잠금을 잠깐 잡아 state 에 합친 뒤 결과를 작업 파일에 남긴다.
 # 외부 프로세스가 세션에 직접 알릴 방법은 없으므로, 결과는 다음에 불리는 훅이 Claude 에게 전한다:
 # 사용자의 다음 메시지(prompt) 또는 workflowy 도구 뒤(track, PostToolUse 추가 문맥).
 
 
-def jpath(sid): return STATE / "sync" / f"{sid}.json"
+def jpath(sid): return DATA_DIR / "sync" / f"{sid}.json"
 
 
 def load_job(sid):
@@ -216,18 +331,7 @@ def load_job(sid):
     except Exception: return {}
 
 
-def save_job(sid, job):
-    """작업 파일을 통째로 바꾼다 (읽는 쪽이 반쯤 쓴 파일을 보지 않게). Windows 는 읽는 중이면 바꾸기가 실패해 몇 번 다시 한다."""
-    p = jpath(sid); p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
-    for _ in range(50):
-        try:
-            os.replace(tmp, p)
-            return
-        except PermissionError:
-            time.sleep(0.05)
-    tmp.unlink(missing_ok=True)
+def save_job(sid, job): put(jpath(sid), job)
 
 
 def alive(pid):
@@ -277,9 +381,9 @@ def start_sync(st, sid, spawn=None):
         (spawn or launch)(sid)
     except Exception as e:
         save_job(sid, {"status": "failed", "root": st["root"], "started": time.time(), "delivered": True})
-        return "\n".join(say + [f"[workflowy] sync 를 시작하지 못했다 ({type(e).__name__}: {e}). 기록 상태는 그대로다."])
+        return "\n".join(say + [f"[workflowy] sync 를 시작하지 못했다 ({type(e).__name__}: {e}). cache 와 state 는 그대로다."])
     return "\n".join(say + [
-        "[workflowy] sync 를 백그라운드에서 시작했다: Workflowy 에서 root 아래 전체를 끝까지 읽는다 (시간 제한 없음). "
+        "[workflowy] sync 를 백그라운드에서 시작했다: Workflowy 에서 root 아래 전체를 끝까지 읽어 cache 를 새로 받는다 (시간 제한 없음). "
         "끝나면 사용자의 다음 메시지나 workflowy 도구 결과 뒤에 결과를 알린다. 그 전까지는 지금 기록으로 일하고, "
         "sync 결과(다른 PC 의 기록, Workflowy 에서 고친 내용)가 필요한 일은 결과가 온 뒤에 한다. "
         "진행 상황은 /workflowy:workstream 로 볼 수 있다고 사용자에게 알린다."])
@@ -295,10 +399,12 @@ def launch(sid):
 
 
 def merge(st, nodes, since):
-    """sync 로 읽은 노드(nodes)를 세션 상태에 합친다. Workflowy 에서 지워진 노드는 빠진다.
+    """sync 로 읽은 노드(nodes)를 state 에 합친다. Workflowy 에서 지워진 노드는 빠진다.
     이 세션이 만든 노드는 track 이 기록한 그대로 두되(steps·닫은 방식) Workflowy 에서 체크된 것은 반영하고,
-    읽기 시작(since) 뒤에 만들어 읽은 트리에 없는 노드는 맨 뒤에 남긴다 (create 는 늘 맨 아래에 붙인다)."""
-    own = {short(n["id"]): n for n in st["nodes"] if not n.get("old")}
+    읽기 시작(since) 뒤에 만들어 읽은 트리에 없는 노드는 맨 뒤에 남긴다 (create 는 늘 맨 아래에 붙인다).
+    이어받은 todo 를 읽기 시작 뒤에 이 세션이 닫았으면(ct) 읽은 트리가 그 전 모습이어도 닫은 쪽을 남긴다."""
+    mine = {short(n["id"]): n for n in st["nodes"]}
+    own = {k: n for k, n in mine.items() if not n.get("old")}
     merged, seen = [], set()
     for x in nodes:
         k = short(x["id"])
@@ -309,6 +415,13 @@ def merge(st, nodes, since):
             if x.get("done") and not y.get("done"):
                 y.update(done=True, **({"outcome": x["outcome"]} if x.get("outcome") else {}))
                 y.pop("held", None)
+        elif not x.get("done") and mine.get(k, {}).get("ct", 0) >= since:
+            z, x = mine[k], dict(x, ct=mine[k]["ct"])
+            if z.get("done"):
+                x.update(done=True, **({"outcome": z["outcome"]} if z.get("outcome") else {}))
+                x.pop("held", None)
+            elif z.get("held"):
+                x["held"] = True
         merged.append(y or x)
     merged += [n for k, n in own.items() if k not in seen and n.get("t", 0) >= since]
     before, after = {short(n["id"]) for n in st["nodes"]}, {short(n["id"]) for n in merged}
@@ -317,7 +430,9 @@ def merge(st, nodes, since):
 
 
 def run_sync(sid, reader=None):
-    """wf.py sync-run: 끝까지 읽고(잠금 없이) 합치기만 잠금 안에서 한다. 결과 글은 작업 파일에 남겨 다음 훅이 전한다."""
+    """wf.py sync-run: 끝까지 읽고(잠금 없이), 읽은 트리로 cache 를 통째로 바꾼 뒤 state 에 합친다(잠금 안에서).
+    cache 는 기록을 멈췄거나 root 를 바꿨어도 바꾼다 — 세션이 아니라 root 의 것이다.
+    결과 글은 작업 파일에 남겨 다음 훅이 전한다."""
     t0 = time.time()
     job = {"status": "running", "pid": os.getpid(), "started": t0, "read": 0, "calls": 0}
     first = load(sid)
@@ -332,30 +447,40 @@ def run_sync(sid, reader=None):
     try:
         if not root:
             raise RuntimeError("이 세션은 기록 중이 아니다")
-        local = {}
-        for n in inherit(sid, root)[0] + first.get("nodes", []):     # 같은 노드면 이 세션 것이 이긴다
-            local[short(n["id"])] = n
-        nodes, warn = (reader or read)(root, list(local.values()), True, progress)
+        cached = {}
+        for n in from_cache(sid, root)[0] + first.get("nodes", []):     # 같은 노드면 이 세션 것이 이긴다
+            cached[short(n["id"])] = n
+        nodes, warn = (reader or read)(root, list(cached.values()), True, progress)
         if nodes is None:
             raise RuntimeError(warn)
+        try:
+            # 이어받음(old)과 이번 읽기의 '하위 일부'(partial)는 세션의 표시다. cache 에는 트리만 남긴다
+            fresh = [{k: v for k, v in n.items() if k not in ("old", "partial")} for n in nodes]
+            kept = save_cache(root, {"root": root, "since": t0, "by": "sync", "nodes": fresh}, newer_than=t0)
+            note = "" if kept else " cache 는 그 사이 다른 세션이 새로 받거나 비워서 그대로 두었다."
+        except OSError as e:
+            log_error("sync", e)
+            note = f" cache 는 바꾸지 못했다({e})."
         lk = lock(sid)
         try:
             st = load(sid)
             if short(st.get("root")) != short(root):
                 job.update(status="skipped", ended=time.time(),
-                           message="sync 가 끝났지만 그 사이 기록을 멈췄거나 다른 노드로 바꿔 합치지 않았다.")
+                           message="sync 가 끝났지만 그 사이 기록을 멈췄거나 다른 노드로 바꿔 이 세션에는 합치지 않았다."
+                                   + (note or " cache 는 새로 받았다."))
             else:
                 added, gone = merge(st, nodes, t0)
                 save(sid, st)
                 job.update(status="done", ended=time.time(), read=len(nodes), message=(
-                    f"sync 끝남 ({int(time.time() - t0)}초): Workflowy 에서 root 아래 전체를 읽어 이어받은 부분을 새로 바꿨다. "
+                    f"sync 끝남 ({int(time.time() - t0)}초): Workflowy 에서 root 아래 전체를 읽어 cache 를 새로 받고 "
+                    f"이 세션이 이어받은 부분을 바꿨다.{note} "
                     f"노드 {len(st['nodes'])}개 (새로 보인 노드 {added}개, 빠진 노드 {gone}개). 아래 트리로 흐름을 다시 파악한다.\n"
                     + outline(st) + pending([n for n in st["nodes"] if n.get("old")]) + ("\n" + warn if warn else "")))
         finally:
             if lk:
                 lk.unlink(missing_ok=True)
     except Exception as e:
-        job.update(status="failed", ended=time.time(), message=f"sync 실패: {str(e).rstrip('.')}. 기록 상태는 그대로다.")
+        job.update(status="failed", ended=time.time(), message=f"sync 실패: {str(e).rstrip('.')}. cache 와 state 는 그대로다.")
         log_error("sync", e)
     save_job(sid, job)
 
@@ -364,7 +489,7 @@ def news(job):
     """job 의 아직 전하지 않은 결과(끝남·실패·중단) 글. 없거나 아직 돌고 있으면 None."""
     if not job or job.get("delivered") or job_state(job) == "running":
         return None
-    return "[workflowy] " + (job.get("message") or ("sync 프로세스가 결과 없이 멈췄다 (중단됨). 기록 상태는 그대로다. "
+    return "[workflowy] " + (job.get("message") or ("sync 프로세스가 결과 없이 멈췄다 (중단됨). cache 와 state 는 그대로다. "
                                                     "필요하면 사용자에게 /workflowy:workstream sync 를 다시 권한다."))
 
 
@@ -467,7 +592,7 @@ def line(n, depth=0):
     if n["type"] == "todo":
         mark = MARK.get(n.get("outcome"), "✓ ") if n.get("done") else "⏸ " if n.get("held") else "☐ "
     at = f", {n['at']}" if n.get("at") else ""
-    part = "  [하위 일부: 이 PC 기록]" if n.get("partial") else ""
+    part = "  [하위 일부: cache]" if n.get("partial") else ""
     return f"{'  ' * depth}- {mark}[{n['type']}] {n['name']}  (id: {short(n['id'])}{at}){part}"
 
 
@@ -519,11 +644,20 @@ def outline(st, limit=80):
     return "\n".join(out)
 
 
+def cache_line(root):
+    """상태 안내·doctor 에 붙일 cache 한 줄."""
+    c, _ = load_cache(root)
+    if c is None:
+        return "없음 (이 PC 에서 sync 한 적 없음 — 시작할 때 state 들을 모두 합친다)"
+    return f"{cache_age(c)}, 노드 {len(c['nodes'])}개"
+
+
 def summary(st, sid=None):
     f = focus(st)
     return (f"기록 root: '{st.get('root_name')}' {wfapi.url(st['root'])}  (root id: {short(st['root'])})\n"
             f"지금 도구 실행이 붙는 노드: {f['name'] + ' (id: ' + short(f['id']) + ')' if f else '없음'}"
-            + (sync_status(sid) if sid else "") + f"\n지금까지 쓴 노드:\n{outline(st)}")
+            + (sync_status(sid) if sid else "") + f"\ncache: {cache_line(st['root'])}"
+            + f"\n지금까지 쓴 노드:\n{outline(st)}")
 
 # ----------------------------------------------------------------- /workflowy:workstream
 
@@ -532,6 +666,37 @@ REMIND = ("[workflowy] 이 세션은 Workflowy 에 기록 중이다. 이 요청�
           "(새 요청은 root 아래에 request: true, 단계는 todo, 단계의 발견·결과는 그 todo 아래에 쓰고 close. "
           "하지 않은 todo 는 done 으로 닫지 않는다). "
           "도구 description 은 사용자의 언어로, 명사형으로 짧게 쓴다 — 그대로 기록된다.")
+
+
+def clear_cache(st, sid):
+    """clear-cache: 이 root 의 cache 를 비우고, 이 세션이 이어받은 노드도 요청과 이 세션이 쓴 노드의 조상만 남긴다.
+    root 등록과 이 세션이 쓴 노드, Workflowy 는 건드리지 않는다. 옛 cache 에서 이어 오던 값(steps, 못 읽은 하위)을
+    끊는 유일한 길이다. 파일을 지우지 않고 비운 시각을 남긴다 — cache 가 없으면 state 들을 모두 합치는
+    3.4 방식(from_states)으로 돌아가 낡은 사본을 다시 불러오기 때문이다."""
+    job = load_job(sid)
+    if job_state(job) == "running":              # 끝나면 옛 cache 로 채운 트리를 cache 에 쓰게 된다
+        return (f"[workflowy] sync 가 돌고 있어 cache 를 비우지 않았다 ({progress_line(job)}). "
+                "끝난 뒤 다시 부르라고 사용자에게 알린다.")
+    root = st["root"]
+    try:
+        save_cache(root, {"root": root, "since": time.time(), "by": "clear-cache", "nodes": []})
+    except OSError as e:
+        return f"[workflowy] cache 를 비우지 못했다 ({e}). 다시 부르라고 사용자에게 알린다."
+    say = [x for x in (sync_news(sid),) if x]    # 앞 sync 의 결과가 남아 있으면 먼저 전한다
+    top, byid, keep = short(root), {short(n["id"]): n for n in st["nodes"]}, set()
+    for n in st["nodes"]:
+        p = None if n.get("old") else n["parent"]
+        while p in byid and p not in keep:
+            keep.add(p)
+            p = byid[p]["parent"]
+    before = len(st["nodes"])
+    st["nodes"] = [n for n in st["nodes"] if not n.get("old") or n["parent"] == top or short(n["id"]) in keep]
+    save(sid, st)
+    return "\n".join(say + [
+        f"[workflowy] cache 를 비웠다. 이 세션이 이어받은 노드도 요청과, 이 세션이 쓴 노드의 조상만 남기고 "
+        f"{before - len(st['nodes'])}개를 뺐다. 앞서 받은 트리에서 빠진 노드는 이제 parent 로 쓸 수 없고, 판단의 근거로 삼지 않는다. "
+        "이 세션이 쓴 노드와 root 등록, Workflowy 는 그대로다. 요청의 하위가 필요하면 사용자에게 "
+        "/workflowy:workstream sync 를 권한다 (옛 cache 없이 Workflowy 에서 새로 받는다).\n지금 트리:\n" + outline(st)])
 
 
 def h_prompt(ev, st, sid, arg):
@@ -550,10 +715,10 @@ def h_prompt(ev, st, sid, arg):
         archive(sid, st)
         return ("[workflowy] 기록을 멈췄습니다. 이미 쓴 노드는 그대로 두고, 다음에 같은 노드로 시작하면 이어받습니다. "
                 "이 세션에서는 더 이상 workflowy 도구를 쓰지 않는다.")
-    if a == "sync":
+    if a in ("sync", "clear-cache"):
         if not st.get("root"):
             return "[workflowy] 기록 중인 세션이 없습니다. /workflowy:workstream <노드 id> 로 먼저 시작하세요."
-        return start_sync(st, sid)
+        return start_sync(st, sid) if a == "sync" else clear_cache(st, sid)
     if a == "doctor":
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -573,11 +738,12 @@ def h_prompt(ev, st, sid, arg):
     prev = st.get("root_name")
     if st.get("root"):
         archive(sid, st)
-    local = inherit(sid, n["id"])[0]
-    old, warn = read(n["id"], local, full=False)
+    cached, c, cwarn = from_cache(sid, n["id"])
+    old, warn = read(n["id"], cached, full=False)
     fell = old is None
     if fell:
-        old, warn = local, warn + " 이 PC 에 남은 기록으로 이어받았다. 다른 PC 의 기록과 Workflowy 에서 고친 내용은 빠져 있다."
+        old, warn = cached, warn + " cache 로만 이어받았다 (요청 목록도 cache 의 것이다). 다른 PC 의 기록과 Workflowy 에서 고친 내용은 빠져 있다."
+    warn = " ".join(x for x in (warn, cwarn) if x)
     st.clear()
     st.update(root=n["id"], root_name=norm(n.get("name"))[:80] or "(제목 없음)",
               started=time.time(), cwd=ev.get("cwd"), nodes=old)
@@ -590,10 +756,13 @@ def h_prompt(ev, st, sid, arg):
     if old:
         ch = kids(st)
         bare = sum(1 for x in old if x.get("request") and not ch.get(short(x["id"])))
+        src = (f"이 PC 의 cache({cache_age(c)})에 그 뒤 이 PC 의 세션들이 쓴 것을 더한 것이다" if c else
+               "이 PC 에 이 root 의 cache 가 아직 없어(sync 한 적 없음) 이 PC 의 state 들을 모두 합친 것이다 — "
+               "끝난 세션의 낡은 사본이 섞여 있을 수 있다")
         out += (f"\n이 노드 아래에 이미 있는 노드 {len(old)}개를 이어받았다. "
-                + ("" if fell else "요청 목록은 Workflowy 에서 읽었고, 요청의 하위는 이 PC 에 남은 기록이다"
-                   + (f" (요청 {bare}개는 이 PC 에 하위 기록이 없어 제목만 보인다)" if bare else "") + ". "
-                   "다른 PC 의 기록이나 Workflowy 에서 직접 고친 내용까지 봐야 하면 사용자에게 /workflowy:workstream sync 를 권한다. ")
+                + ("" if fell else "요청 목록은 Workflowy 에서 읽었고, 요청의 하위는 " + src
+                   + (f" (요청 {bare}개는 하위가 없어 제목만 보인다)" if bare else "") + ". "
+                   "그 뒤 다른 PC 에서 쓰거나 Workflowy 에서 직접 고친 내용까지 봐야 하면 사용자에게 /workflowy:workstream sync 를 권한다. ")
                 + "먼저 아래 내용으로 지금까지의 흐름을 파악한다. 이어받은 노드 아래에도 쓸 수 있고, 이어받은 todo 도 close 할 수 있다.\n"
                 + outline(st) + pending(old))
     if warn:
@@ -709,12 +878,12 @@ def h_track(ev, st, sid):
         for nid, parent in NOTE.findall(r):         # close 가 쓴 이유 노드. by 로 결과와 구별한다
             st["nodes"].append({"id": nid, "parent": short(parent), "type": "bullets", "t": time.time(),
                                 "name": name, "by": outcome})
-        for cid, o in CLOSED.findall(r):
+        for cid, o in CLOSED.findall(r):         # ct: 닫은 시각. 다른 세션이 cache 를 받은 뒤에 닫았는지 가린다
             n = find(st, cid)
             if n and o == "hold":
-                n["held"] = True
+                n.update(held=True, ct=time.time())
             elif n:
-                n.update(done=True, outcome=o)
+                n.update(done=True, outcome=o, ct=time.time())
                 n.pop("held", None)
     save(sid, st)
 
@@ -770,7 +939,7 @@ def h_session_start(ev, st):
 
 def new_errors():
     """지난 확인 이후 쌓인 오류 줄. 기록 실패가 조용히 묻히지 않게 한 번씩 알린다."""
-    seen = STATE / "error.seen"
+    seen = DATA_DIR / "error.seen"
     try:
         size = ERRLOG.stat().st_size
         done = int(seen.read_text()) if seen.exists() else 0
@@ -789,7 +958,7 @@ def do_doctor(st):
     ok = True
     key = wfapi.conf("WORKFLOWY_API_KEY", "api_key")
     print(f"  {'ok ' if key else 'FAIL'} API key      {'설정됨' if key else '없음'}")
-    print(f"  ok  상태 저장    {STATE}")
+    print(f"  ok  데이터 폴더  {DATA_DIR}")
     print(f"  ok  Python       {sys.version.split()[0]}")
     ok &= bool(key)
     if key:
@@ -814,8 +983,10 @@ def do_doctor(st):
         except Exception as e:
             print(f"  FAIL 트리 읽기    {type(e).__name__}: {e}"); ok = False
     old = sum(1 for n in st.get("nodes") or [] if n.get("old"))
-    print(f"  --  기록 상태    " + (f"'{st['root_name']}' 에 기록 중, 만든 노드 {len(st['nodes']) - old}개"
+    print(f"  --  state        " + (f"'{st['root_name']}' 에 기록 중, 만든 노드 {len(st['nodes']) - old}개"
                                   + (f", 이어받은 노드 {old}개" if old else "") if st.get("root") else "기록 중 아님"))
+    if st.get("root"):
+        print(f"  --  cache        {cache_line(st['root'])}  ({cpath(st['root'])})")
 
     if ERRLOG.exists() and ERRLOG.stat().st_size:
         print(f"\n  주의: {ERRLOG} 에 기록된 오류가 있습니다 (마지막 5줄)")
@@ -877,8 +1048,8 @@ def main():
     sys.stderr.reconfigure(encoding="utf-8")
 
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if not STATE:
-        print("[workflowy] 플러그인 훅 밖에서 실행되어 API key 와 기록 상태를 쓸 수 없습니다.\n"
+    if not DATA_DIR:
+        print("[workflowy] 플러그인 훅 밖에서 실행되어 API key 와 데이터 폴더(state·cache)를 쓸 수 없습니다.\n"
               "점검은 /workflowy:workstream doctor 로 하세요.", file=sys.stderr)
         sys.exit(1)
     if mode == "sync-run":                       # 훅이 아니라 start_sync 가 띄운 백그라운드 프로세스

@@ -3,7 +3,7 @@
 mcp.py - Claude 가 Workflowy 작업 로그를 직접 쓰는 MCP 서버 (stdio, 표준 라이브러리만).
 
 도구는 만들기(create)와 todo 닫기(close) 둘뿐이다. 이미 쓴 노드를 고치거나 지우는 도구는 두지 않는다.
-어느 노드 아래에 쓸 수 있는지는 세션 상태를 아는 훅(wf.py guard)이 도구 호출 전에 검사한다.
+어느 노드 아래에 쓸 수 있는지는 state 를 아는 훅(wf.py guard)이 도구 호출 전에 검사한다.
 서버는 세션을 모르므로 상태를 갖지 않는다.
 """
 import json, sys, urllib.error
