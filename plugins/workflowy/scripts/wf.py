@@ -4,7 +4,7 @@ wf.py - workflowy 플러그인의 훅. 기록 내용은 Claude 가 MCP 도구(mc
 
   prompt         UserPromptSubmit  /workflowy:workstream <id> | stop | doctor | (없음: 상태)
   guard          PreToolUse        workflowy 도구 호출 검사 — root 아래, 이 세션이 만들었거나 이어받은 노드만 허용
-  track          PostToolUse       workflowy 도구가 만든 노드·완료를 세션 상태에 기록
+  track          PostToolUse       workflowy 도구가 만든 노드와 닫은 todo 를 세션 상태에 기록
   step           PreToolUse        그 밖의 도구 실행을 지금 작업 중인 노드 아래에 자동으로 붙인다
   session-start  SessionStart      resume/compact 뒤 기록 중이라는 사실과 노드 구조를 다시 알려준다
 
@@ -68,7 +68,8 @@ def archive(sid, st):
 def inherit(sid, root):
     """다른 세션들(멈춘 세션 포함)이 같은 root 에 쓴 노드와 그 세션 수.
     create 는 늘 맨 아래에 붙이므로 만든 시각 순이 곧 문서 순서다. 시각이 없는 노드는 그 세션의 시작 시각으로 본다.
-    이어받은 세션도 그 노드를 갖고 있으므로 한 노드가 여러 파일에 있을 수 있다. 어느 쪽이든 완료했으면 완료."""
+    이어받은 세션도 그 노드를 갖고 있으므로 한 노드가 여러 파일에 있을 수 있다.
+    어느 쪽이든 닫았으면 닫힌 것, 그렇지 않고 어느 쪽이든 보류했으면 보류."""
     got, sids = [], set()
     for p in (STATE / "state").glob("*.json"):
         if p == spath(sid):
@@ -85,7 +86,10 @@ def inherit(sid, root):
         k = short(n["id"])
         if k in seen:
             if n.get("done"):
-                seen[k]["done"] = True
+                seen[k].update(done=True, **({"outcome": n["outcome"]} if n.get("outcome") else {}))
+                seen[k].pop("held", None)
+            elif n.get("held") and not seen[k].get("done"):
+                seen[k]["held"] = True
             continue
         seen[k] = dict(n, t=t, old=True)
         out.append(seen[k])
@@ -103,12 +107,19 @@ def kids(st):
     return out
 
 
+def below(ch, n):
+    """n 의 모든 하위 노드 (ch 는 kids 의 결과)."""
+    for c in ch.get(short(n["id"]), []):
+        yield c
+        yield from below(ch, c)
+
+
 def focus(st):
     """도구 실행을 붙일 노드. 트리 순서로 첫 번째 열린 todo 에서 시작해 그 아래 열린 todo 로 끝까지 내려간다.
     Phase 를 한꺼번에 만들어 두어도 지금 하는 Phase(그 안의 지금 하는 작업)에 붙는다.
     열린 todo 가 없으면 steps=true 로 만든 노드나 root 바로 아래 노드(요청) 중 마지막 것.
     이어받은 노드는 고르지 않는다. 새 요청을 만들기 전의 도구 실행이 이전 세션의 기록에 섞이지 않게 한다.
-    이어받은 열린 todo 의 아래에 이 세션이 만든 todo 는 고른다."""
+    보류된 todo 도 고르지 않는다. 이어받았거나 보류된 todo 의 아래에 이 세션이 만든 todo 는 고른다 (이어서 하는 방법)."""
     ch = kids(st)
 
     def walk(p):
@@ -117,7 +128,7 @@ def focus(st):
                 if n.get("done") or not n.get("steps", True):
                     continue
                 r = walk(short(n["id"]))
-                if r or not n.get("old"):
+                if r or not (n.get("old") or n.get("held")):
                     return r or n
                 continue
             r = walk(short(n["id"]))
@@ -139,9 +150,18 @@ def find(st, nid):
     return next((n for n in st.get("nodes") or [] if short(n["id"]) == s), None) if s else None
 
 
+MARK = {"done": "✓ ", "cancel": "✕ ", "replace": "↪ "}     # 닫힌 todo. outcome 이 없는 것(3.1 이전)은 완료
+
+
 def line(n, depth=0):
-    mark = ("✓ " if n.get("done") else "☐ ") if n["type"] == "todo" else ""
+    mark = ""
+    if n["type"] == "todo":
+        mark = MARK.get(n.get("outcome"), "✓ ") if n.get("done") else "⏸ " if n.get("held") else "☐ "
     return f"{'  ' * depth}- {mark}[{n['type']}] {n['name']}  (id: {short(n['id'])})"
+
+
+def is_open(n): return n["type"] == "todo" and not n.get("done") and not n.get("held")
+def is_held(n): return n["type"] == "todo" and not n.get("done") and n.get("held")
 
 
 def lines(st, top=None, depth=0):
@@ -180,9 +200,10 @@ def outline(st, limit=80):
         return n
 
     out = [f"root 바로 아래 {len(top)}개 (오래된 순):"] + tail([line(n) for n in top], 30)
-    todo = [n for n in st["nodes"] if n["type"] == "todo" and not n.get("done")]
-    if todo:
-        out += ["열린 todo:"] + [f"{line(n)}  ← {under(n)['name']}" for n in todo]
+    for title, test in (("열린 todo:", is_open), ("보류된 todo:", is_held)):
+        todo = [n for n in st["nodes"] if test(n)]
+        if todo:
+            out += [title] + [f"{line(n)}  ← {under(n)['name']}" for n in todo]
     out += [f"마지막 항목 '{top[-1]['name']}' 의 하위:"] + tail(lines(st, top[-1]["id"], 1), 40)
     return "\n".join(out)
 
@@ -197,7 +218,7 @@ def summary(st):
 
 
 REMIND = ("[workflowy] 이 세션은 Workflowy 에 기록 중이다. 이 요청도 진행하는 대로 root 아래에 정리해 쓴다 "
-          "(단계는 todo, 단계의 발견·결과는 그 todo 아래에 쓰고 complete). "
+          "(단계는 todo, 단계의 발견·결과는 그 todo 아래에 쓰고 close. 하지 않은 todo 는 done 으로 닫지 않는다). "
           "도구 description 은 사용자의 언어로, 명사형으로 짧게 쓴다 — 그대로 기록된다.")
 
 
@@ -244,11 +265,15 @@ def h_prompt(ev, st, sid, arg):
         out += f"\n(이전에 기록하던 '{prev}' 대신 이 노드에 기록한다. 이전 노드들은 parent 로 쓸 수 없다.)"
     if old:
         out += (f"\n이전 세션 {k}개가 이 노드에 쓴 노드 {len(old)}개를 이어받았다. "
-                "먼저 아래 내용으로 지금까지의 흐름을 파악한다. 이어받은 노드 아래에도 쓸 수 있고, 이어받은 todo 도 complete 할 수 있다.\n"
+                "먼저 아래 내용으로 지금까지의 흐름을 파악한다. 이어받은 노드 아래에도 쓸 수 있고, 이어받은 todo 도 close 할 수 있다.\n"
                 + outline(st))
-        if any(x["type"] == "todo" and not x.get("done") for x in old):
-            out += ("\n열린 todo 가 남아 있다. 이미 끝났으면 결과를, 하지 않을 일이면 `취소: 이유` 를 그 아래에 쓰고 complete 한다. "
-                    "이어서 할 일이면 그대로 둔다.")
+        if any(is_open(x) for x in old):
+            out += ("\n열린 todo 가 남아 있다. 이미 끝났으면 close(done, 결과), 하지 않을 일이면 close(cancel, 이유), "
+                    "나중에 할 일이면 close(hold, 이유). 이어서 할 일이면 그대로 두고 그 아래에 새 todo 를 만든다.")
+        if any(is_held(x) for x in old):
+            out += ("\n보류된 todo 가 있다. 같은 방법으로 이어서 하면 그 아래에 재개 todo 를 만든다. "
+                    "방법이 바뀌었으면 close(replace, 이유) 후 새 요청으로, 안 할 거면 close(cancel, 이유), "
+                    "이미 끝났으면 close(done, 결과).")
     err = new_errors()
     if err:
         out += f"\n[workflowy] 지난 확인 이후 기록 오류 {len(err)}건. 마지막: {err[-1]} — 사용자에게 알린다."
@@ -276,39 +301,85 @@ def h_guard(ev, st):
             return decide(True)
         return decide(False, f"parent 는 기록 root({short(st['root'])}) 이거나 이 세션에서 만들었거나 이어받은 노드여야 한다. "
                              "지금까지 쓴 노드:\n" + tree(st, 30))
-    if tool == "complete":
-        n = find(st, i.get("id"))
-        if not n:
-            return decide(False, "이 세션에서 만들었거나 이어받은 todo 만 완료 처리할 수 있다 (root 와 그 밖의 노드는 건드리지 않는다).")
-        if n["type"] != "todo":
-            return decide(False, f"'{n['name']}' 은 todo 가 아니다 ({n['type']}).")
-        if n.get("done"):
-            return decide(False, f"'{n['name']}' 은 이미 완료되었다.")
-        return decide(True)
+    if tool == "close":
+        return decide(*check_close(st, i))
     return decide(False, f"알 수 없는 workflowy 도구: {tool}")
 
 
-ID = re.compile(r"(?:id|completed): ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+def check_close(st, i):
+    """(허용 여부, 거부 이유). 하지 않은 todo 가 결과 없이 완료로 남지 않게 한다."""
+    ids, outcome = wfapi.ids_of(i.get("ids")), i.get("outcome") or "done"
+    reason = str(i.get("reason") or "").strip()
+    if not ids:
+        return False, "ids 에 닫을 todo 의 id 를 준다."
+    if outcome not in wfapi.OUTCOMES:
+        return False, f"outcome 은 {' | '.join(wfapi.OUTCOMES)} 중 하나다."
+    if outcome != "done" and not reason:
+        return False, f"{outcome} 은 reason 이 필요하다 (todo 아래에 '{wfapi.close_note(outcome, '…')}' 로 쓰인다)."
+    ns = []
+    for x in ids:
+        n = find(st, x)
+        if not n:
+            return False, f"{x}: 이 세션에서 만들었거나 이어받은 todo 만 닫을 수 있다 (root 와 그 밖의 노드는 건드리지 않는다)."
+        if n["type"] != "todo":
+            return False, f"'{n['name']}' 은 todo 가 아니다 ({n['type']})."
+        if n.get("done"):
+            return False, f"'{n['name']}' 은 이미 닫혔다."
+        if outcome == "hold" and n.get("held"):
+            return False, f"'{n['name']}' 은 이미 보류되었다. 이어서 하려면 그 아래에 새 todo 를 만든다."
+        ns.append(n)
+    ch, closing = kids(st), {short(n["id"]) for n in ns}
+    for n in ns:
+        # close 가 쓴 이유 노드(⏸ 보류 등)는 결과가 아니다
+        if outcome == "done" and not reason and not [c for c in ch.get(short(n["id"]), []) if not c.get("by")]:
+            return False, (f"'{n['name']}' 아래에 쓴 결과가 없다. 끝냈으면 reason 에 한 줄 결과를 넣는다. "
+                           "하지 않았다면 outcome 을 cancel(하지 않기로 함)·replace(방법이 바뀜)·hold(나중에 함) 중에서 고른다.")
+        # 하위 todo 가 열린 채 남으면 도구 실행 대상에서 빠지거나(닫힌 부모 아래) 보류한 일 아래에서 이어진다
+        left = [d for d in below(ch, n) if d["type"] == "todo" and not d.get("done") and d.get("steps", True)
+                and short(d["id"]) not in closing and not (outcome == "hold" and d.get("held"))]
+        if left:
+            return False, (f"'{n['name']}' 아래에 아직 닫지 않은 todo 가 있다: "
+                           + ", ".join(f"'{d['name']}' ({short(d['id'])})" for d in left) + ". ids 에 함께 넣는다.")
+    return True, ""
+
+
+ID     = re.compile(r"id: ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+# close 의 결과 줄 (mcp.py close). 응답이 JSON 으로 감싸여 와도 읽히도록 id 는 16진수와 - 만 받는다.
+NOTE   = re.compile(r"note: ([0-9a-f-]{12,36}) under ([0-9a-f-]{12,36})")
+CLOSED = re.compile(r"closed: ([0-9a-f-]{12,36}) (" + "|".join(wfapi.OUTCOMES) + r")\b")
 
 
 def h_track(ev, st, sid):
     if ev.get("agent_id") or not st.get("root"):
         return
     i, tool = ev.get("tool_input") or {}, ev.get("tool_name", "")[len(TOOL):]
-    m = ID.search(json.dumps(ev.get("tool_response"), ensure_ascii=False))
-    if not m:
-        return                                   # 실패한 호출
+    r = ev.get("tool_response")
+    r = r if isinstance(r, str) else json.dumps(r, ensure_ascii=False)
     if tool == "create":
+        m = ID.search(r)
+        if not m:
+            return                               # 실패한 호출
         t = i.get("type") or "bullets"
         name = norm(str(i.get("name") or "").split("\n")[0]) if t != "code" else "(코드)"
         st["nodes"].append({"id": m.group(1), "parent": short(i.get("parent")), "type": t, "t": time.time(),
-                            "name": name[:60] + ("…" if len(name) > 60 else ""),
-                            **({"steps": bool(i["steps"])} if "steps" in i else {})})
-    elif tool == "complete":
-        n = find(st, m.group(1))
-        if n:
-            n["done"] = True
+                            "name": clip(name), **({"steps": bool(i["steps"])} if "steps" in i else {})})
+    elif tool == "close":
+        outcome = i.get("outcome") or "done"
+        name = clip(norm(wfapi.close_note(outcome, str(i.get("reason") or "").strip()).split("\n")[0]))
+        for nid, parent in NOTE.findall(r):         # close 가 쓴 이유 노드. by 로 결과와 구별한다
+            st["nodes"].append({"id": nid, "parent": short(parent), "type": "bullets", "t": time.time(),
+                                "name": name, "by": outcome})
+        for cid, o in CLOSED.findall(r):
+            n = find(st, cid)
+            if n and o == "hold":
+                n["held"] = True
+            elif n:
+                n.update(done=True, outcome=o)
+                n.pop("held", None)
     save(sid, st)
+
+
+def clip(s, n=60): return s[:n] + ("…" if len(s) > n else "")
 
 # ----------------------------------------------------------------- 도구 실행 자동 기록
 
@@ -347,7 +418,8 @@ def h_session_start(ev, st):
     if not st.get("root"):
         return None
     return ("[workflowy] 이 세션은 Workflowy 에 작업 기록 중이다 (/workflowy:workstream 스킬의 지침을 계속 따른다).\n"
-            "- 지금 하는 작업은 workflowy create 도구로 root 아래에 정리해 쓰고, todo 는 끝나는 대로 complete 한다.\n"
+            "- 지금 하는 작업은 workflowy create 도구로 root 아래에 정리해 쓰고, todo 는 끝나는 대로 close 한다 "
+            "(끝냄 done · 안 함 cancel · 방법 바뀜 replace · 미룸 hold).\n"
             "- 도구 실행은 훅이 열린 todo 아래에 자동으로 붙인다. 도구의 description 은 명사형으로 짧게 쓴다.\n"
             "- 이미 쓴 노드는 고치거나 지우지 않고, 새 노드를 추가만 한다.\n" + summary(st))
 

@@ -22,6 +22,9 @@ MD = re.compile(r"([*`\[\]])")
 # 제목(h1·h2·h3)은 쓰지 않는다. 요청·주제는 굵은 bullets 로 쓴다.
 TYPES = ("bullets", "todo", "p", "quote-block", "code")
 
+# todo 를 닫는 방식과, 그 todo 아래에 쓰는 이유 노드의 머리말. hold 만 체크하지 않는다.
+OUTCOMES = {"done": "결과", "cancel": "✕ 취소", "replace": "↪ 변경", "hold": "⏸ 보류"}
+
 SHORT = re.compile(r"(?:#/)?([0-9a-f]{12})/?$")   # URL 끝, short id, 전체 UUID 모두 끝 12자리가 같다
 
 
@@ -111,3 +114,13 @@ def complete(nid):
     full = nid if "-" in str(nid) else get(nid)["id"]
     call("POST", f"/nodes/{full}/complete")
     return full
+
+
+def ids_of(v):
+    """close 의 ids. 배열이 정상이지만 문자열 하나도 받는다."""
+    return [v] if isinstance(v, str) else [x for x in (v or []) if x]
+
+
+def close_note(outcome, reason):
+    """close 가 todo 아래에 쓰는 이유 노드의 name."""
+    return f"{OUTCOMES[outcome]}: {reason}"
