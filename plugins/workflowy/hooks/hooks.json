@@ -6,7 +6,7 @@
                     "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" session-start" }] }
     ],
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "timeout": 15,
+      { "hooks": [{ "type": "command", "timeout": 30,
                     "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" prompt" }] }
     ],
     "PreToolUse": [

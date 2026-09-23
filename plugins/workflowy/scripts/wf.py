@@ -2,7 +2,7 @@
 """
 wf.py - workflowy 플러그인의 훅. 기록 내용은 Claude 가 MCP 도구(mcp.py)로 직접 쓰고, 훅은 그 주변을 맡는다.
 
-  prompt         UserPromptSubmit  /workflowy:workstream <id> | stop | doctor | (없음: 상태)
+  prompt         UserPromptSubmit  /workflowy:workstream <id> | sync | stop | doctor | (없음: 상태)
   guard          PreToolUse        workflowy 도구 호출 검사 — root 아래, 이 세션이 만들었거나 이어받은 노드만 허용
   track          PostToolUse       workflowy 도구가 만든 노드와 닫은 todo 를 세션 상태에 기록
   step           PreToolUse        그 밖의 도구 실행을 지금 작업 중인 노드 아래에 자동으로 붙인다
@@ -21,6 +21,7 @@ STATE  = pathlib.Path(DATA) if DATA else None       # 업데이트에도 보존�
 ERRLOG = STATE / "error.log" if STATE else None
 SKILL  = re.compile(r"^/(?:workflowy:)?workstream\b\s*(.*)$", re.S)    # 사용자가 직접 입력한 스킬
 TOOL   = "mcp__plugin_workflowy_workflowy__"          # 플러그인 MCP 서버 도구 이름의 접두사
+LIMIT  = 20       # doctor 가 트리 읽기를 잴 때의 시간 한도(초). prompt 훅 timeout(hooks.json, 30초) 안에 끝나야 한다
 # Claude Code 가 스스로 넣는 턴(에이전트 보고, 완료 알림 등). source 필드가 없는 버전은 내용으로 판단한다.
 SYSTEM = re.compile(r"\s*(<(agent-message|task-notification|system-reminder|local-command-caveat)\b"
                     r"|Another Claude session sent a message:|\[SYSTEM NOTIFICATION)")
@@ -66,7 +67,8 @@ def archive(sid, st):
 
 
 def inherit(sid, root):
-    """다른 세션들(멈춘 세션 포함)이 같은 root 에 쓴 노드와 그 세션 수.
+    """이 PC 의 다른 세션들(멈춘 세션 포함)이 같은 root 에 쓴 노드와 그 세션 수. Workflowy 트리를 읽지 못할 때 대신 쓰고,
+    읽었을 때도 Workflowy 에 없는 steps 와 시간 한도로 못 읽은 하위를 여기서 채운다 (sync, from_api).
     create 는 늘 맨 아래에 붙이므로 만든 시각 순이 곧 문서 순서다. 시각이 없는 노드는 그 세션의 시작 시각으로 본다.
     이어받은 세션도 그 노드를 갖고 있으므로 한 노드가 여러 파일에 있을 수 있다.
     어느 쪽이든 닫았으면 닫힌 것, 그렇지 않고 어느 쪽이든 보류했으면 보류."""
@@ -94,6 +96,288 @@ def inherit(sid, root):
         seen[k] = dict(n, t=t, old=True)
         out.append(seen[k])
     return out, len(sids)
+
+
+MODES  = ("bullets", "todo", "p", "quote-block", "h1", "h2", "h3")   # 그대로 받는 layoutMode (code-block 은 code)
+REASON = {v: k for k, v in wfapi.OUTCOMES.items()}                 # close 가 쓴 이유 노드의 머리말 -> outcome
+REASON_RE = re.compile("(" + "|".join(map(re.escape, REASON)) + "): ")
+STAMP  = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}")               # 요청 note 첫 줄의 날짜·시각 (wfapi.request_note)
+
+
+def reason_of(name):
+    m = REASON_RE.match(name)
+    return REASON[m.group(1)] if m else None
+
+
+def from_api(root, t, local, mark=True):
+    """Workflowy 에서 읽은 트리(wfapi.subtree)를 이어받을 상태 노드 목록으로. priority 순 DFS 로 둔다 —
+    kids() 가 목록 순서를 문서 순서로 본다. ▹ 도구 실행 노드는 넣지 않는다.
+    Workflowy 에 없는 steps 는 로컬 기록(local)에서 가져오고, 닫은 방식·보류는 close 가 쓴 이유 노드로 되살린다.
+    하위를 읽지 못한 노드(t["missing"])는 그 아래를 로컬 기록으로 채우고, mark 면 partial 로 표시한다."""
+    ch = {}
+    for n in t["nodes"]:
+        n["_name"] = norm(wfapi.unhtml(n.get("name")))
+        ch.setdefault(short(n.get("parent_id")), []).append(n)
+    for v in ch.values():
+        v.sort(key=lambda n: n.get("priority") or 0)
+    mine, lk, top = {short(n["id"]): n for n in local}, kids({"nodes": local}), short(root)
+    missing, out = {short(x) for x in t["missing"]}, []
+
+    def conv(n, parent):
+        mode = (n.get("data") or {}).get("layoutMode") or "bullets"
+        typ = "code" if mode == "code-block" else mode if mode in MODES else "bullets"
+        x = {"id": n["id"], "parent": parent, "type": typ, "t": n.get("createdAt") or 0, "old": True,
+             "name": "(코드)" if typ == "code" else clip(n["_name"])}
+        if parent == top:
+            x["request"] = True
+            d = STAMP.match(n.get("note") or "")
+            if d:
+                x["at"] = d.group(0)
+        if typ == "bullets" and reason_of(n["_name"]):
+            x["by"] = reason_of(n["_name"])
+        if typ == "todo":
+            rs = [r for r in (reason_of(c["_name"]) for c in ch.get(short(n["id"]), [])) if r]
+            if n.get("completed"):
+                x["done"] = True
+                closed = [r for r in rs if r != "hold"]
+                if closed:
+                    x["outcome"] = closed[-1]
+            elif "hold" in rs:
+                x["held"] = True
+        m = mine.get(short(n["id"]))
+        if m and "steps" in m:
+            x["steps"] = m["steps"]
+        return x
+
+    def walk(p):
+        for n in ch.get(p, []):
+            if n["_name"].startswith("▹ "):
+                continue
+            x = conv(n, p)
+            out.append(x)
+            if short(n["id"]) in missing:
+                if mark:
+                    x["partial"] = True
+                out.extend(dict(d, old=True) for d in below(lk, x))
+            else:
+                walk(short(n["id"]))
+
+    walk(top)
+    return out
+
+
+def read(root, local, full, progress=None):
+    """Workflowy 에서 읽어 이어받을 노드와 Claude 에게 알릴 한 줄. 읽지 못하면 노드 대신 None.
+    full 이면 root 아래 전체를 끝까지(백그라운드 sync), 아니면 root 의 자식(요청 목록)만 읽고 하위는 로컬 기록(local)으로
+    채운다(기록 시작). 전체는 노드마다 호출하므로 오래 걸린다 — 그래서 시작은 가볍게, 전체는 훅 밖에서 읽는다."""
+    try:
+        if full:
+            t = wfapi.subtree(root, None, progress=progress)
+        else:
+            top = wfapi.children(root)
+            t = {"nodes": top, "missing": [n["id"] for n in top], "errors": 0}
+    except Exception as e:
+        why = f"HTTP {e.code}" if isinstance(e, urllib.error.HTTPError) else type(e).__name__
+        return None, f"Workflowy 에서 {'트리를' if full else '요청 목록을'} 읽지 못했다({why})."
+    nodes = from_api(root, t, local, mark=full)
+    part = [n for n in nodes if n.get("partial")]
+    if not part:
+        return nodes, None
+    # 긴 트리는 요약(outline)에 요청 목록과 마지막 요청만 나와 '하위 일부' 표시가 안 보이므로 여기서 직접 적는다
+    names = ", ".join(f"'{n['name']}' ({short(n['id'])})" for n in part[:10])
+    return nodes, (f"호출 실패({t['errors']}번)로 {len(part)}개 노드의 하위를 읽지 못해 이 PC 기록으로 채웠다: {names}"
+                   + (f" 외 {len(part) - 10}개" if len(part) > 10 else "") + ".")
+
+
+def pending(nodes):
+    """이어받은 노드에 끝나지 않은 todo 가 있으면 사용자에게 물으라는 안내."""
+    o, h = sum(1 for x in nodes if is_open(x)), sum(1 for x in nodes if is_held(x))
+    if not (o or h):
+        return ""
+    return (f"\n끝나지 않은 todo 가 있다 (☐ 열림 {o}개, ⏸ 보류 {h}개). 사용자가 Workflowy 에 직접 적은 것일 수도 있으니 "
+            "혼자 판단해 닫거나 이어서 하지 않는다. 먼저 목록을 보여 주고 각각 어떻게 할지 사용자에게 묻는다: "
+            "이어서 하기(그 아래에 새 todo) / 끝난 것으로 닫기(close done, 결과) / 취소(cancel) / 보류(hold) / 그대로 두기. "
+            "사용자가 이미 지시했으면 묻지 않고 따른다. 보류된 todo 를 방법을 바꿔 하기로 하면 close(replace, 이유) 후 새 요청으로.")
+
+
+# ----------------------------------------------------------------- sync (백그라운드)
+# /workflowy:workstream sync 는 훅 timeout 에 묶이지 않도록 훅이 분리된 프로세스(wf.py sync-run)를 띄우고 곧바로 끝난다.
+# 그 프로세스가 끝까지 읽고, 잠금을 잠깐 잡아 세션 상태에 합친 뒤 결과를 작업 파일에 남긴다.
+# 외부 프로세스가 세션에 직접 알릴 방법은 없으므로, 결과는 다음에 불리는 훅이 Claude 에게 전한다:
+# 사용자의 다음 메시지(prompt) 또는 workflowy 도구 뒤(track, PostToolUse 추가 문맥).
+
+
+def jpath(sid): return STATE / "sync" / f"{sid}.json"
+
+
+def load_job(sid):
+    try:    return json.loads(jpath(sid).read_text(encoding="utf-8"))
+    except Exception: return {}
+
+
+def save_job(sid, job):
+    """작업 파일을 통째로 바꾼다 (읽는 쪽이 반쯤 쓴 파일을 보지 않게). Windows 는 읽는 중이면 바꾸기가 실패해 몇 번 다시 한다."""
+    p = jpath(sid); p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+    for _ in range(50):
+        try:
+            os.replace(tmp, p)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+    tmp.unlink(missing_ok=True)
+
+
+def alive(pid):
+    if not pid:
+        return False
+    if os.name == "nt":
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, int(pid))          # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        k.GetExitCodeProcess(h, ctypes.byref(code))
+        k.CloseHandle(h)
+        return code.value == 259                           # STILL_ACTIVE
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def job_state(job):
+    """running 인데 프로세스가 없으면 중단된 것으로 본다. 띄운 직후 pid 를 적기 전(1분 안)은 도는 중으로 본다."""
+    s = job.get("status")
+    if s == "running" and not alive(job.get("pid")) and not (not job.get("pid") and time.time() - job.get("started", 0) < 60):
+        return "dead"
+    return s
+
+
+def progress_line(job):
+    return (f"노드 {job.get('read', 0)}개 읽음, 호출 {job.get('calls', 0)}번, "
+            f"{int(time.time() - job.get('started', time.time()))}초째")
+
+
+def start_sync(st, sid, spawn=None):
+    """prompt 훅: 백그라운드 sync 를 띄우고 곧바로 돌아온다. 이미 돌고 있으면 진행 상황만 알린다."""
+    job = load_job(sid)
+    if job_state(job) == "running":
+        return f"sync 가 이미 돌고 있다 ({progress_line(job)}). 끝나면 결과를 알린다."
+    save_job(sid, {"status": "running", "root": st["root"], "started": time.time(), "pid": None})
+    try:
+        (spawn or launch)(sid)
+    except Exception as e:
+        save_job(sid, {"status": "failed", "root": st["root"], "started": time.time(), "delivered": True})
+        return f"sync 를 시작하지 못했다 ({type(e).__name__}: {e}). 기록 상태는 그대로다."
+    return ("sync 를 백그라운드에서 시작했다: Workflowy 에서 root 아래 전체를 끝까지 읽는다 (시간 제한 없음). "
+            "끝나면 사용자의 다음 메시지나 workflowy 도구 결과 뒤에 결과를 알린다. 그 전까지는 지금 기록으로 일하고, "
+            "sync 결과(다른 PC 의 기록, Workflowy 에서 고친 내용)가 필요한 일은 결과가 온 뒤에 한다. "
+            "진행 상황은 /workflowy:workstream 로 볼 수 있다고 사용자에게 알린다.")
+
+
+def launch(sid):
+    """wf.py sync-run <sid> 를 분리된 프로세스로 띄운다. 표준 입출력을 끊어야 Claude Code 가 파이프를 기다리지 않는다.
+    API key 와 CLAUDE_PLUGIN_DATA 는 환경변수로 그대로 넘어간다 (Claude 에게는 보이지 않는다)."""
+    import subprocess
+    kw = {"creationflags": 0x00000008 | 0x00000200} if os.name == "nt" else {"start_new_session": True}
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "sync-run", sid], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, **kw)
+
+
+def merge(st, nodes, since):
+    """sync 로 읽은 노드(nodes)를 세션 상태에 합친다. Workflowy 에서 지워진 노드는 빠진다.
+    이 세션이 만든 노드는 track 이 기록한 그대로 두되(steps·닫은 방식) Workflowy 에서 체크된 것은 반영하고,
+    읽기 시작(since) 뒤에 만들어 읽은 트리에 없는 노드는 맨 뒤에 남긴다 (create 는 늘 맨 아래에 붙인다)."""
+    own = {short(n["id"]): n for n in st["nodes"] if not n.get("old")}
+    merged, seen = [], set()
+    for x in nodes:
+        k = short(x["id"])
+        seen.add(k)
+        y = own.get(k)
+        if y:
+            y = dict(y)
+            if x.get("done") and not y.get("done"):
+                y.update(done=True, **({"outcome": x["outcome"]} if x.get("outcome") else {}))
+                y.pop("held", None)
+        merged.append(y or x)
+    merged += [n for k, n in own.items() if k not in seen and n.get("t", 0) >= since]
+    before, after = {short(n["id"]) for n in st["nodes"]}, {short(n["id"]) for n in merged}
+    st["nodes"] = merged
+    return len(after - before), len(before - after)
+
+
+def run_sync(sid, reader=None):
+    """wf.py sync-run: 끝까지 읽고(잠금 없이) 합치기만 잠금 안에서 한다. 결과 글은 작업 파일에 남겨 다음 훅이 전한다."""
+    t0 = time.time()
+    job = {"status": "running", "pid": os.getpid(), "started": t0, "read": 0, "calls": 0}
+    first = load(sid)
+    root = first.get("root")
+    job["root"] = root
+    save_job(sid, job)
+
+    def progress(n, c):
+        job.update(read=n, calls=c)
+        save_job(sid, job)
+
+    try:
+        if not root:
+            raise RuntimeError("이 세션은 기록 중이 아니다")
+        local = {}
+        for n in inherit(sid, root)[0] + first.get("nodes", []):     # 같은 노드면 이 세션 것이 이긴다
+            local[short(n["id"])] = n
+        nodes, warn = (reader or read)(root, list(local.values()), True, progress)
+        if nodes is None:
+            raise RuntimeError(warn)
+        lk = lock(sid)
+        try:
+            st = load(sid)
+            if short(st.get("root")) != short(root):
+                job.update(status="skipped", ended=time.time(),
+                           message="sync 가 끝났지만 그 사이 기록을 멈췄거나 다른 노드로 바꿔 합치지 않았다.")
+            else:
+                added, gone = merge(st, nodes, t0)
+                save(sid, st)
+                job.update(status="done", ended=time.time(), read=len(nodes), message=(
+                    f"sync 끝남 ({int(time.time() - t0)}초): Workflowy 에서 root 아래 전체를 읽어 이어받은 부분을 새로 바꿨다. "
+                    f"노드 {len(st['nodes'])}개 (새로 보인 노드 {added}개, 빠진 노드 {gone}개). 아래 트리로 흐름을 다시 파악한다.\n"
+                    + outline(st) + pending([n for n in st["nodes"] if n.get("old")]) + ("\n" + warn if warn else "")))
+        finally:
+            if lk:
+                lk.unlink(missing_ok=True)
+    except Exception as e:
+        job.update(status="failed", ended=time.time(), message=f"sync 실패: {str(e).rstrip('.')}. 기록 상태는 그대로다.")
+        log_error("sync", e)
+    save_job(sid, job)
+
+
+def sync_news(sid):
+    """아직 전하지 않은 sync 결과(끝남·실패·중단)가 있으면 그 글을 돌려주고 전한 것으로 표시한다."""
+    job = load_job(sid)
+    s = job_state(job)
+    if not job or job.get("delivered") or s == "running":
+        return None
+    msg = job.get("message") or ("sync 프로세스가 결과 없이 멈췄다 (중단됨). 기록 상태는 그대로다. "
+                                 "필요하면 사용자에게 /workflowy:workstream sync 를 다시 권한다.")
+    job["delivered"] = True
+    save_job(sid, job)
+    return "[workflowy] " + msg
+
+
+def sync_status(sid):
+    """상태 안내에 붙일 sync 한 줄."""
+    job = load_job(sid)
+    s = job_state(job)
+    if not job:
+        return ""
+    if s == "running":
+        return f"\nsync 진행 중: {progress_line(job)}."
+    if s == "dead":
+        return "\nsync 가 결과 없이 멈췄다 (중단됨)."
+    return f"\n마지막 sync: {s} ({datetime.fromtimestamp(job.get('ended', job.get('started', 0))):%m-%d %H:%M})."
 
 
 def norm(s): return " ".join(str(s or "").split())
@@ -171,7 +455,9 @@ def line(n, depth=0):
     mark = ""
     if n["type"] == "todo":
         mark = MARK.get(n.get("outcome"), "✓ ") if n.get("done") else "⏸ " if n.get("held") else "☐ "
-    return f"{'  ' * depth}- {mark}[{n['type']}] {n['name']}  (id: {short(n['id'])})"
+    at = f", {n['at']}" if n.get("at") else ""
+    part = "  [하위 일부: 이 PC 기록]" if n.get("partial") else ""
+    return f"{'  ' * depth}- {mark}[{n['type']}] {n['name']}  (id: {short(n['id'])}{at}){part}"
 
 
 def is_open(n): return n["type"] == "todo" and not n.get("done") and not n.get("held")
@@ -222,11 +508,11 @@ def outline(st, limit=80):
     return "\n".join(out)
 
 
-def summary(st):
+def summary(st, sid=None):
     f = focus(st)
     return (f"기록 root: '{st.get('root_name')}' {wfapi.url(st['root'])}  (root id: {short(st['root'])})\n"
-            f"지금 도구 실행이 붙는 노드: {f['name'] + ' (id: ' + short(f['id']) + ')' if f else '없음'}\n"
-            f"지금까지 쓴 노드:\n{outline(st)}")
+            f"지금 도구 실행이 붙는 노드: {f['name'] + ' (id: ' + short(f['id']) + ')' if f else '없음'}"
+            + (sync_status(sid) if sid else "") + f"\n지금까지 쓴 노드:\n{outline(st)}")
 
 # ----------------------------------------------------------------- /workflowy:workstream
 
@@ -238,18 +524,25 @@ REMIND = ("[workflowy] 이 세션은 Workflowy 에 기록 중이다. 이 요청�
 
 
 def h_prompt(ev, st, sid, arg):
-    if arg is None:                              # 사용자 요청: 기록 중이면 지침을 짧게 상기시킨다
+    if arg is None:                              # 사용자 요청: 기록 중이면 지침을 짧게 상기시킨다. 끝난 sync 결과도 전한다
         by_user = ev.get("source", "user") == "user" and not SYSTEM.match(ev.get("prompt") or "")
-        return REMIND if st.get("root") and by_user else None
+        say = [x for x in (sync_news(sid), REMIND if st.get("root") and by_user else None) if x]
+        return "\n".join(say) or None
     a = arg.strip()
     if a in ("", "status"):
-        return "[workflowy] " + (summary(st) if st.get("root") else "기록 중인 세션이 없습니다.")
+        if not st.get("root"):
+            return "[workflowy] 기록 중인 세션이 없습니다."
+        return "\n".join(x for x in ("[workflowy] " + summary(st, sid), sync_news(sid)) if x)
     if a == "stop":
         if not st.get("root"):
             return "[workflowy] 기록 중인 세션이 없습니다."
         archive(sid, st)
         return ("[workflowy] 기록을 멈췄습니다. 이미 쓴 노드는 그대로 두고, 다음에 같은 노드로 시작하면 이어받습니다. "
                 "이 세션에서는 더 이상 workflowy 도구를 쓰지 않는다.")
+    if a == "sync":
+        if not st.get("root"):
+            return "[workflowy] 기록 중인 세션이 없습니다. /workflowy:workstream <노드 id> 로 먼저 시작하세요."
+        return "[workflowy] " + start_sync(st, sid)
     if a == "doctor":
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -269,7 +562,11 @@ def h_prompt(ev, st, sid, arg):
     prev = st.get("root_name")
     if st.get("root"):
         archive(sid, st)
-    old, k = inherit(sid, n["id"])
+    local = inherit(sid, n["id"])[0]
+    old, warn = read(n["id"], local, full=False)
+    fell = old is None
+    if fell:
+        old, warn = local, warn + " 이 PC 에 남은 기록으로 이어받았다. 다른 PC 의 기록과 Workflowy 에서 고친 내용은 빠져 있다."
     st.clear()
     st.update(root=n["id"], root_name=norm(n.get("name"))[:80] or "(제목 없음)",
               started=time.time(), cwd=ev.get("cwd"), nodes=old)
@@ -280,16 +577,16 @@ def h_prompt(ev, st, sid, arg):
     if prev:
         out += f"\n(이전에 기록하던 '{prev}' 대신 이 노드에 기록한다. 이전 노드들은 parent 로 쓸 수 없다.)"
     if old:
-        out += (f"\n이전 세션 {k}개가 이 노드에 쓴 노드 {len(old)}개를 이어받았다. "
-                "먼저 아래 내용으로 지금까지의 흐름을 파악한다. 이어받은 노드 아래에도 쓸 수 있고, 이어받은 todo 도 close 할 수 있다.\n"
-                + outline(st))
-        if any(is_open(x) for x in old):
-            out += ("\n열린 todo 가 남아 있다. 이미 끝났으면 close(done, 결과), 하지 않을 일이면 close(cancel, 이유), "
-                    "나중에 할 일이면 close(hold, 이유). 이어서 할 일이면 그대로 두고 그 아래에 새 todo 를 만든다.")
-        if any(is_held(x) for x in old):
-            out += ("\n보류된 todo 가 있다. 같은 방법으로 이어서 하면 그 아래에 재개 todo 를 만든다. "
-                    "방법이 바뀌었으면 close(replace, 이유) 후 새 요청으로, 안 할 거면 close(cancel, 이유), "
-                    "이미 끝났으면 close(done, 결과).")
+        ch = kids(st)
+        bare = sum(1 for x in old if x.get("request") and not ch.get(short(x["id"])))
+        out += (f"\n이 노드 아래에 이미 있는 노드 {len(old)}개를 이어받았다. "
+                + ("" if fell else "요청 목록은 Workflowy 에서 읽었고, 요청의 하위는 이 PC 에 남은 기록이다"
+                   + (f" (요청 {bare}개는 이 PC 에 하위 기록이 없어 제목만 보인다)" if bare else "") + ". "
+                   "다른 PC 의 기록이나 Workflowy 에서 직접 고친 내용까지 봐야 하면 사용자에게 /workflowy:workstream sync 를 권한다. ")
+                + "먼저 아래 내용으로 지금까지의 흐름을 파악한다. 이어받은 노드 아래에도 쓸 수 있고, 이어받은 todo 도 close 할 수 있다.\n"
+                + outline(st) + pending(old))
+    if warn:
+        out += "\n" + warn
     err = new_errors()
     if err:
         out += f"\n[workflowy] 지난 확인 이후 기록 오류 {len(err)}건. 마지막: {err[-1]} — 사용자에게 알린다."
@@ -330,7 +627,7 @@ def check_create(st, i):
                        "요청 안에 쓸 내용이면 parent 를 그 요청(이나 하위 노드)으로 준다."
                        + (f" 지금 요청: '{r['name']}' (id: {short(r['id'])})" if r else ""))
     if req and p != root:
-        return False, f"요청(request: true)은 root({root}) 바로 아래에만 만든다. 요청 안의 주제는 굵은 bullets 로 쓴다."
+        return False, f"요청(request: true)은 root({root}) 바로 아래에만 만든다. 요청 안의 주제는 bullets 로 쓴다."
     if req and (i.get("type") or "bullets") != "bullets":
         return False, "요청은 bullets 로 만든다 (굵게와 날짜·시각 note 는 서버가 붙인다)."
     return True, ""
@@ -391,10 +688,10 @@ def h_track(ev, st, sid):
             return                               # 실패한 호출
         t, req = i.get("type") or "bullets", i.get("request") is True
         name = norm(str(i.get("name") or "").strip("\n").split("\n")[0]) if t != "code" else "(코드)"
-        name = wfapi.request_name(name) if req else name       # 서버가 붙인 굵게까지 실제 제목과 같게
+        name = wfapi.request_title(name) if req else name      # 서버가 걷어 내는 ** 까지 sync 로 읽은 제목과 같게
         st["nodes"].append({"id": m.group(1), "parent": short(i.get("parent")), "type": t, "t": time.time(),
                             "name": clip(name), **({"steps": bool(i["steps"])} if "steps" in i else {}),
-                            **({"request": True} if req else {})})
+                            **({"request": True, "at": f"{datetime.now():%Y-%m-%d %H:%M}"} if req else {})})
     elif tool == "close":
         outcome = i.get("outcome") or "done"
         name = clip(norm(wfapi.close_note(outcome, str(i.get("reason") or "").strip()).split("\n")[0]))
@@ -454,7 +751,8 @@ def h_session_start(ev, st):
             "todo 는 끝나는 대로 close 한다 "
             "(끝냄 done · 안 함 cancel · 방법 바뀜 replace · 미룸 hold).\n"
             "- 도구 실행은 훅이 열린 todo 아래에 자동으로 붙인다. 도구의 description 은 명사형으로 짧게 쓴다.\n"
-            "- 이미 쓴 노드는 고치거나 지우지 않고, 새 노드를 추가만 한다.\n" + summary(st))
+            "- 이미 쓴 노드는 고치거나 지우지 않고, 새 노드를 추가만 한다.\n" + summary(st, ev.get("session_id"))
+            + ("\n" + (sync_news(ev.get("session_id")) or "")).rstrip())
 
 # ----------------------------------------------------------------- 점검
 
@@ -499,6 +797,11 @@ def do_doctor(st):
             print(f"  FAIL API 연결     {code}"); ok = False
         except Exception as e:
             print(f"  FAIL API 연결     {type(e).__name__}: {e}"); ok = False
+    if key and ok and st.get("root"):
+        try:
+            check_tree(st["root"])
+        except Exception as e:
+            print(f"  FAIL 트리 읽기    {type(e).__name__}: {e}"); ok = False
     old = sum(1 for n in st.get("nodes") or [] if n.get("old"))
     print(f"  --  기록 상태    " + (f"'{st['root_name']}' 에 기록 중, 만든 노드 {len(st['nodes']) - old}개"
                                   + (f", 이어받은 노드 {old}개" if old else "") if st.get("root") else "기록 중 아님"))
@@ -510,6 +813,40 @@ def do_doctor(st):
 
     print("\n" + ("전부 정상." if ok else "문제가 있습니다. 위의 FAIL 항목을 확인하세요."))
     return 0 if ok else 1
+
+
+def check_tree(root, limit=LIMIT):
+    """이어받기가 root 아래를 얼마나 빨리, 어디까지 읽는지. API 가 돌려주는 이름·layoutMode 원문도 보여 준다."""
+    try:
+        t, via = wfapi.subtree(short(root), limit), "short id"
+    except urllib.error.HTTPError as e:
+        print(f"  --  트리 읽기    short id 로 실패 (HTTP {e.code}), 전체 UUID 로 다시 읽음")
+        t, via = wfapi.subtree(root, limit), "UUID"
+    ns, times = t["nodes"], sorted(t["times"])
+    top = [n for n in ns if short(n.get("parent_id")) == short(root)]
+    kinds = {}
+    for n in ns:
+        k = (n.get("data") or {}).get("layoutMode") or "(없음)"
+        kinds[k] = kinds.get(k, 0) + 1
+    retried = ", ".join(f"HTTP {c} {k}번" for c, k in sorted(wfapi.RETRIED.items())) or "없음"
+    print(f"  {'ok ' if not t['missing'] else 'WARN'} 트리 읽기    노드 {len(ns)}개 (요청 {len(top)}개), "
+          f"호출 {len(times) + t['errors'] + 1}번, {t['seconds']:.1f}초 (한도 {limit}초, {via})")
+    if times:
+        print(f"                   호출당 중앙값 {times[len(times) // 2]:.2f}초, 최대 {times[-1]:.2f}초")
+    print(f"                   실패 {t['errors']}번, 재시도 {retried}, 못 읽은 노드 {len(t['missing'])}개")
+    print("  --  layoutMode   " + ", ".join(f"{k} {v}" for k, v in sorted(kinds.items(), key=lambda x: -x[1])))
+
+    def raw(s): return json.dumps(str(s or "")[:80], ensure_ascii=False)
+    def has(n, *xs): return any(x in (n.get("name") or "") for x in xs)
+    def code(n): return (n.get("data") or {}).get("layoutMode") == "code-block"
+    for label, n, f in (
+            ("요청 제목", top[-1] if top else None, "name"),
+            ("요청 note", top[-1] if top else None, "note"),
+            ("코드 블록", next((n for n in ns if code(n)), None), "name"),
+            ("인라인 코드", next((n for n in ns if has(n, "`", "<code>") and not code(n)), None), "name"),
+            ("▹ 기록", next((n for n in ns if has(n, "▹")), None), "name")):
+        if n:
+            print(f"  --  원문         {label}: {raw(n.get(f))}")
 
 # ----------------------------------------------------------------- 진입점
 
@@ -532,6 +869,10 @@ def main():
         print("[workflowy] 플러그인 훅 밖에서 실행되어 API key 와 기록 상태를 쓸 수 없습니다.\n"
               "점검은 /workflowy:workstream doctor 로 하세요.", file=sys.stderr)
         sys.exit(1)
+    if mode == "sync-run":                       # 훅이 아니라 start_sync 가 띄운 백그라운드 프로세스
+        try: run_sync(sys.argv[2])
+        except Exception as e: log_error("sync", e)
+        sys.exit(0)
     try: ev = json.loads(sys.stdin.read() or "{}")
     except Exception: ev = {}
     sid = ev.get("session_id", "")
@@ -543,13 +884,15 @@ def main():
        ((mode in ("step", "session-start") or (mode == "prompt" and not m)) and not spath(sid).exists()):
         sys.exit(0)
 
-    say, target = None, None
+    say, target, ctx = None, None, None
     lk = lock(sid)
     try:
         st = load(sid)
         if   mode == "prompt":        say = h_prompt(ev, st, sid, m.group(1) if m else None)
         elif mode == "guard":         h_guard(ev, st)
-        elif mode == "track":         h_track(ev, st, sid)
+        elif mode == "track":
+            h_track(ev, st, sid)
+            ctx = None if ev.get("agent_id") else sync_news(sid)     # 끝난 sync 결과는 도구 결과 뒤에 붙여 전한다
         elif mode == "step":          target = h_step(ev, st, sid, d)
         elif mode == "session-start": say = h_session_start(ev, st)
     except Exception as e:
@@ -564,6 +907,9 @@ def main():
         except Exception as e: log_error(mode, e)
     if say:                                      # UserPromptSubmit·SessionStart 의 stdout 은 Claude 의 컨텍스트가 된다
         print(say)
+    if ctx:                                      # PostToolUse 는 JSON 의 additionalContext 로 전한다
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": ctx}},
+                         ensure_ascii=False))
     sys.exit(0)   # 훅은 무슨 일이 있어도 0. exit 2는 세션을 차단한다.
 
 

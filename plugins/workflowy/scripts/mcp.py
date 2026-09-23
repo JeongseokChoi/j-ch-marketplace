@@ -9,7 +9,7 @@ mcp.py - Claude 가 Workflowy 작업 로그를 직접 쓰는 MCP 서버 (stdio, 
 import json, sys, urllib.error
 import wfapi
 
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 
 INSTRUCTIONS = (
     "사용자가 /workflowy:workstream <id> 로 기록을 시작한 세션에서만 쓴다. "
@@ -23,9 +23,10 @@ TOOLS = [
          "root 바로 아래에는 요청만 쓴다: 새 요청은 parent=root, request=true 로 만든다(제목은 굵게, note 첫 줄에 날짜·시각이 "
          "자동으로 붙는다). 요청 안에 쓸 노드는 parent 를 그 요청이나 하위 노드로 준다. "
          "방금 만든 노드 아래에 쓸 노드는 그 id 를 받은 뒤에 부른다. "
-         "type: bullets(일반 항목. 요청 안의 큰 주제는 **굵게**) | todo(체크할 작업, 끝나거나 멈추면 close) | "
-         "p(단락) | quote-block(인용) | code(코드·명령·로그, name 에 코드 원문). "
-         "name 은 마크다운(**굵게**, `코드`, [링크](url))을 쓸 수 있다. "
+         "type: bullets(일반 항목. 요청 안의 큰 주제도 bullets 로 두고 하위를 들여 쓴다) | "
+         "todo(체크할 작업, 끝나거나 멈추면 close) | p(단락) | quote-block(인용) | code(코드·명령·로그, name 에 코드 원문). "
+         "name 은 평문이다: 서식은 붙지 않는다(요청 제목의 굵게만 서버가 붙인다). "
+         "Workflowy 가 서식·태그로 읽는 글자는 서버가 비슷한 글자로 바꿔 보낸다(< > → ‹ ›, * → ∗, 백틱 → ˋ). "
          "code 가 아닌 type 에서 여러 줄 name 은 첫 줄만 제목이 되고 나머지는 note 로 간다. "
          "긴 설명은 note 에 넣는다."),
      "inputSchema": {
