@@ -4,8 +4,8 @@ wfapi.py - Workflowy API 공통 부분. MCP 서버(mcp.py)와 훅(wf.py)이 함�
 API key 는 플러그인 userConfig 에서 온다. MCP 서버에는 plugin.json 의 env 로 WORKFLOWY_API_KEY 를,
 훅에는 Claude Code 가 CLAUDE_PLUGIN_OPTION_API_KEY 를 넘긴다. Claude 의 Bash 에는 둘 다 없다.
 """
-import html, json, os, queue, re, threading, time, urllib.parse, urllib.request, urllib.error
-from datetime import datetime
+import email.utils, html, json, os, queue, re, threading, time, urllib.parse, urllib.request, urllib.error
+from datetime import datetime, timezone
 
 API = "https://workflowy.com/api/v1"
 
@@ -47,6 +47,13 @@ LEAF_NAME  = re.compile(r"\s*(?:" + re.escape(TOOL) + "|(?:" + "|".join(map(re.e
 LEAF_TYPES = ("p", "quote-block", "code-block")
 
 RETRIED, _lock = {}, threading.Lock()              # 재시도한 HTTP 상태 코드별 횟수 (doctor 가 병렬 읽기를 볼 때 쓴다)
+
+# call 이 짧게(1.5초, 3초) 기다렸다 다시 부르는 HTTP 상태 코드. 훅·MCP 는 응답이 늦어지면 안 되므로 이것만 쓴다.
+RETRY = (429, 500, 502, 503, 504)
+# 백그라운드 sync 가 요청 한도(HTTP 429)에 걸렸을 때 기다리는 시간(초). 성공 없이 429 가 이어지면 차례로 늘리고,
+# 다 기다리고도 429 면 포기한다 (Gate). 응답에 Retry-After 가 있으면 그 값을 따르되 RETRY_CAP 초를 넘지 않는다.
+BACKOFF, RETRY_CAP = (10, 20, 30, 30, 60, 60), 120
+IDLE = 120                                         # 백그라운드 sync 가 결과 없이 이만큼(초) 지나면 멈춘다 (한도로 멈춘 시간은 빼고)
 
 
 def conf(env, key):
@@ -102,7 +109,8 @@ def short(nid):
 def url(nid): return f"https://workflowy.com/#/{short(nid)}"
 
 
-def call(method, path, body=None, tries=3):
+def call(method, path, body=None, tries=3, retry=RETRY):
+    """retry 에 든 HTTP 상태 코드와 연결 오류는 짧게 기다렸다 다시 부른다 (모두 tries 번까지)."""
     key = conf("WORKFLOWY_API_KEY", "api_key")
     if not key:
         raise RuntimeError("Workflowy API key 없음 (플러그인 설정의 api_key 를 확인하세요)")
@@ -114,7 +122,7 @@ def call(method, path, body=None, tries=3):
             with urllib.request.urlopen(req, timeout=8) as r:
                 return json.loads(r.read() or b"{}")
         except urllib.error.HTTPError as e:
-            if e.code in (429, 500, 502, 503, 504) and i < tries - 1:
+            if e.code in retry and i < tries - 1:
                 with _lock:
                     RETRIED[e.code] = RETRIED.get(e.code, 0) + 1
                 time.sleep(1.5 * (i + 1)); continue
@@ -130,10 +138,94 @@ def get(nid):
     return call("GET", f"/nodes/{nid}")["node"]
 
 
-def children(parent):
+def children(parent, retry=RETRY):
     """parent 의 직계 자식. API 는 순서 없이 주므로 priority 순으로 정렬한다."""
     q = urllib.parse.urlencode({"parent_id": parent})
-    return sorted(call("GET", f"/nodes?{q}").get("nodes") or [], key=lambda n: n.get("priority") or 0)
+    return sorted(call("GET", f"/nodes?{q}", retry=retry).get("nodes") or [], key=lambda n: n.get("priority") or 0)
+
+
+class Gate:
+    """한 프로세스의 작업자들이 함께 쓰는 멈춤. 누구든 429 를 받으면 멈춤이 끝나는 시각을 정하고,
+    모든 작업자가 다음 호출 전에 그때까지 기다린다 — 한도에 걸린 동안 호출을 계속 보내지 않는다.
+    기다리는 시간은 Retry-After, 없으면 BACKOFF 를 차례로 쓴다. 단계는 sync 전체에서 센다: 멈춤이 풀린 뒤 성공 없이
+    또 429 면 한 단계 올리고, 한 번이라도 성공하면 처음으로 돌린다. BACKOFF 를 다 기다리고도 성공 없이 429 면
+    포기한다(spent) — 그 뒤의 호출은 부르지 않고 같은 429 로 실패한다."""
+
+    def __init__(self):
+        self.until, self.waits, self.level, self.strained, self.spent = 0.0, 0, 0, False, None
+        self._lock = threading.Lock()
+
+    def hold(self, e):
+        """429(e)를 받았다. 새로 멈추면 True, 이미 멈춘 동안 받은 것이거나 포기했으면 False."""
+        with self._lock:
+            now, ra = time.time(), retry_after(e)
+            if now < self.until:                   # 이미 멈춘 동안 받은 429 (그 전에 보낸 호출) 는 같은 멈춤으로 본다
+                if ra is not None:
+                    self.until = max(self.until, now + ra)
+                return False
+            if self.strained:                      # 지난 멈춤이 풀린 뒤 한 번도 성공하지 못했다
+                self.level += 1
+            if self.level >= len(BACKOFF):
+                self.spent = e
+                return False
+            self.waits += 1
+            self.strained = True
+            self.until = now + (ra if ra is not None else BACKOFF[self.level])
+            return True
+
+    def ok(self):
+        with self._lock:
+            self.level, self.strained = 0, False
+
+    def paused(self):
+        return time.time() < self.until
+
+    def wait(self):
+        while True:
+            with self._lock:
+                left = self.until - time.time()
+            if left <= 0:
+                return
+            time.sleep(left)
+
+
+def retry_after(e):
+    """429 응답의 Retry-After(초 또는 HTTP 날짜)를 초로. 없거나 읽지 못하면 None. 1초에서 RETRY_CAP 초 사이로 맞춘다."""
+    v = (e.headers.get("Retry-After") if getattr(e, "headers", None) else None) or ""
+    try:
+        sec = float(v)
+    except ValueError:
+        try:
+            sec = (email.utils.parsedate_to_datetime(v) - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, IndexError):
+            return None
+    return max(1.0, min(sec, RETRY_CAP))
+
+
+def patient(fn, gate, waited=None):
+    """백그라운드 sync 의 호출. 429 를 받으면 gate 로 모든 작업자를 멈추고 기다렸다 다시 부른다.
+    fn 은 429 를 스스로 재시도하지 않아야 한다 (retry 에서 429 를 뺀 호출). 다른 오류는 그대로 올린다.
+    한 호출은 len(BACKOFF)+1 번까지 부른다 — 다른 노드는 성공하는데 이 노드만 계속 429 일 때의 끝.
+    waited 는 새로 멈출 때마다 불린다 (진행 표시를 바로 갱신할 때)."""
+    for i in range(len(BACKOFF) + 1):
+        gate.wait()
+        if gate.spent:
+            raise gate.spent
+        try:
+            got = fn()
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or i == len(BACKOFF):
+                raise
+            if gate.hold(e) and waited:
+                waited()
+            continue
+        gate.ok()
+        return got
+
+
+def why(e):
+    """실패 이유를 짧게: HTTP 상태 코드, 아니면 예외 이름."""
+    return f"HTTP {e.code}" if isinstance(e, urllib.error.HTTPError) else type(e).__name__
 
 
 def leaf(n):
@@ -149,16 +241,24 @@ def tool_run(n):
 def subtree(root, limit=20.0, workers=8, progress=None):
     """root 아래 트리를 읽는다. root 의 자식(요청 목록)을 먼저 읽고, 최신 요청부터 그 하위를 병렬로 읽는다.
     limit 초(시간 한도)가 지나면 멈추고 읽은 만큼 돌려준다. 훅 timeout 에 걸려 통째로 잃지 않기 위해서다.
-    limit 이 None 이면 끝까지 읽는다 (백그라운드 sync). progress(노드 수, 호출 수) 는 2초에 한 번쯤 불린다.
+    limit 이 None 이면 끝까지 읽는다 (백그라운드 sync). 이때만 요청 한도(429)에 오래 기다린다: 모든 작업자가 함께
+    멈추고 BACKOFF 만큼 기다렸다 다시 부른다 (patient). 훅·doctor(limit 있음)는 call 의 짧은 재시도 그대로다.
+    progress(노드 수, 호출 수, 한도 대기 횟수) 는 2초에 한 번쯤 불린다.
     그 노드 수는 ▹ 도구 실행을 뺀 수다 — 이어받는 트리(from_api)가 ▹ 를 넣지 않으므로, sync 가 끝난 뒤 알리는 수와 맞춘다.
     root 의 자식을 읽지 못하면 예외를 그대로 올린다 (호출한 쪽이 로컬 기록으로 대체한다).
     돌려주는 값: nodes(API 노드. 트리 순서가 아니다), missing(자식을 읽지 못한 노드 id), times(성공한 호출별 초),
-    errors(실패한 호출 수), seconds(전체 초).
+    errors(실패한 호출 수), reasons(실패 이유별 횟수), waits(한도로 멈춘 횟수), seconds(전체 초).
     스레드는 daemon 으로 직접 띄운다. ThreadPoolExecutor 는 프로세스가 끝날 때 한도를 넘긴 호출까지 기다린다."""
     t0 = time.time()
     end = None if limit is None else t0 + limit
-    top = children(root)
-    nodes, times, failed = list(top), [], []
+    gate = Gate()
+    if limit is None:                            # 429 는 call 이 짧게 재시도하지 않고 patient 가 기다린다
+        slow = tuple(c for c in RETRY if c != 429)
+        def get(nid, waited=None): return patient(lambda: children(nid, retry=slow), gate, waited)
+    else:
+        def get(nid, waited=None): return children(nid)
+    top = get(root, lambda: progress and progress(0, 0, gate.waits))
+    nodes, times, failed, reasons = list(top), [], [], {}
     kept = sum(1 for n in top if not tool_run(n))     # progress 에 알리는 노드 수 (▹ 제외)
     todo, done, stop = queue.PriorityQueue(), queue.Queue(), threading.Event()
     waiting = set()                              # 넣었지만 아직 결과를 받지 못한 노드
@@ -174,7 +274,7 @@ def subtree(root, limit=20.0, workers=8, progress=None):
                 return
             s = time.time()
             try:
-                got = children(nid)
+                got = get(nid)
             except Exception as e:
                 got = e
             done.put((rank, depth, nid, got, time.time() - s))
@@ -184,16 +284,35 @@ def subtree(root, limit=20.0, workers=8, progress=None):
             put(rank, 0, n)
     for _ in range(workers if waiting else 0):
         threading.Thread(target=work, daemon=True).start()
-    shown = time.time()
+    shown = last = time.time()
+
+    def report():
+        nonlocal shown
+        if progress and time.time() - shown >= 2:
+            shown = time.time()
+            progress(kept, len(times) + len(failed) + 1, gate.waits)
+
     while waiting and (end is None or time.time() < end):
         try:
-            # 한도가 없어도 결과가 2분 동안 하나도 안 오면 멈춘다 (호출 하나는 재시도까지 30초 안쪽이다)
-            rank, depth, nid, got, sec = done.get(timeout=120 if end is None else end - time.time())
-        except (queue.Empty, ValueError):         # ValueError: 그 사이 한도가 지나 timeout 이 음수
+            rank, depth, nid, got, sec = done.get(timeout=2 if end is None else end - time.time())
+        except ValueError:                       # 그 사이 한도가 지나 timeout 이 음수
             break
+        except queue.Empty:
+            if end is not None:
+                break
+            # 한도가 없어도 결과가 IDLE 초 동안 하나도 안 오면 멈춘다 (호출 하나는 재시도까지 30초 안쪽이다).
+            # 429 로 다 같이 멈춘 동안은 세지 않는다
+            if gate.paused():
+                last = time.time()
+            elif time.time() - last >= IDLE:
+                break
+            report()
+            continue
+        last = time.time()
         waiting.discard(nid)
         if isinstance(got, Exception):
             failed.append(nid)
+            reasons[why(got)] = reasons.get(why(got), 0) + 1
         else:
             times.append(sec)
             nodes += got
@@ -201,12 +320,10 @@ def subtree(root, limit=20.0, workers=8, progress=None):
             for c in got:
                 if not leaf(c):
                     put(rank, depth + 1, c)
-        if progress and time.time() - shown >= 2:     # 방금 받은 자식까지 센 뒤에 알린다
-            shown = time.time()
-            progress(kept, len(times) + len(failed) + 1)
+        report()                                 # 방금 받은 자식까지 센 뒤에 알린다
     stop.set()
     return {"nodes": nodes, "missing": failed + sorted(waiting), "times": times, "errors": len(failed),
-            "seconds": time.time() - t0}
+            "reasons": reasons, "waits": gate.waits, "seconds": time.time() - t0}
 
 
 def request_title(name):

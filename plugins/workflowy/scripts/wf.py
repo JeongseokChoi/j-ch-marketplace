@@ -177,15 +177,16 @@ def read(root, local, full, progress=None):
             top = wfapi.children(root)
             t = {"nodes": top, "missing": [n["id"] for n in top], "errors": 0}
     except Exception as e:
-        why = f"HTTP {e.code}" if isinstance(e, urllib.error.HTTPError) else type(e).__name__
-        return None, f"Workflowy 에서 {'트리를' if full else '요청 목록을'} 읽지 못했다({why})."
+        return None, f"Workflowy 에서 {'트리를' if full else '요청 목록을'} 읽지 못했다({wfapi.why(e)})."
     nodes = from_api(root, t, local, mark=full)
     part = [n for n in nodes if n.get("partial")]
     if not part:
         return nodes, None
     # 긴 트리는 요약(outline)에 요청 목록과 마지막 요청만 나와 '하위 일부' 표시가 안 보이므로 여기서 직접 적는다
     names = ", ".join(f"'{n['name']}' ({short(n['id'])})" for n in part[:10])
-    return nodes, (f"호출 실패({t['errors']}번)로 {len(part)}개 노드의 하위를 읽지 못해 이 PC 기록으로 채웠다: {names}"
+    reasons = ", ".join(f"{k} {v}번" for k, v in sorted((t.get("reasons") or {}).items(), key=lambda x: -x[1]))
+    return nodes, (f"호출 실패({t['errors']}번{': ' + reasons if reasons else ''})로 {len(part)}개 노드의 하위를 "
+                   f"읽지 못해 이 PC 기록으로 채웠다: {names}"
                    + (f" 외 {len(part) - 10}개" if len(part) > 10 else "") + ".")
 
 
@@ -259,7 +260,8 @@ def job_state(job):
 
 def progress_line(job):
     return (f"노드 {job.get('read', 0)}개 읽음, 호출 {job.get('calls', 0)}번, "
-            f"{int(time.time() - job.get('started', time.time()))}초째")
+            + (f"한도(429) 대기 {job['waits']}번, " if job.get("waits") else "")
+            + f"{int(time.time() - job.get('started', time.time()))}초째")
 
 
 def start_sync(st, sid, spawn=None):
@@ -323,8 +325,8 @@ def run_sync(sid, reader=None):
     job["root"] = root
     save_job(sid, job)
 
-    def progress(n, c):
-        job.update(read=n, calls=c)
+    def progress(n, c, w=0):
+        job.update(read=n, calls=c, waits=w)
         save_job(sid, job)
 
     try:
