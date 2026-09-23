@@ -21,6 +21,9 @@ STATE  = pathlib.Path(DATA) if DATA else None       # 업데이트에도 보존�
 ERRLOG = STATE / "error.log" if STATE else None
 SKILL  = re.compile(r"^/(?:workflowy:)?session-log\b\s*(.*)$", re.S)   # 사용자가 직접 입력한 스킬
 TOOL   = "mcp__plugin_workflowy_workflowy__"          # 플러그인 MCP 서버 도구 이름의 접두사
+# Claude Code 가 스스로 넣는 턴(에이전트 보고, 완료 알림 등). source 필드가 없는 버전은 내용으로 판단한다.
+SYSTEM = re.compile(r"\s*(<(agent-message|task-notification|system-reminder|local-command-caveat)\b"
+                    r"|Another Claude session sent a message:|\[SYSTEM NOTIFICATION)")
 HEADS  = ("h1", "h2", "h3")
 
 # ----------------------------------------------------------------- 상태
@@ -126,8 +129,9 @@ REMIND = ("[workflowy] 이 세션은 Workflowy 에 기록 중이다. 이 요청�
 
 
 def h_prompt(ev, st, sid, arg):
-    if arg is None:                              # 일반 요청: 기록 중이면 지침을 짧게 상기시킨다
-        return REMIND if st.get("root") else None
+    if arg is None:                              # 사용자 요청: 기록 중이면 지침을 짧게 상기시킨다
+        by_user = ev.get("source", "user") == "user" and not SYSTEM.match(ev.get("prompt") or "")
+        return REMIND if st.get("root") and by_user else None
     a = arg.strip()
     if a in ("", "status"):
         return "[workflowy] " + (summary(st) if st.get("root") else "기록 중인 세션이 없습니다.")
