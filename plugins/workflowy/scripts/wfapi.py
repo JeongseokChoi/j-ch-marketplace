@@ -39,9 +39,11 @@ OUTCOMES = {"done": "결과", "cancel": "✕ 취소", "replace": "↪ 변경", "
 
 SHORT = re.compile(r"(?:#/)?([0-9a-f]{12})/?$")   # URL 끝, short id, 전체 UUID 모두 끝 12자리가 같다
 
+TOOL = "▹ "                                        # 훅이 도구 실행마다 붙이는 노드의 머리말
+
 # 트리를 읽을 때 자식을 읽지 않는 노드: 훅이 붙인 ▹ 도구 실행, close 가 쓴 이유 노드, 단락·인용·코드.
 # 우리가 그 아래에 쓰지 않으므로 호출을 아낀다.
-LEAF_NAME  = re.compile(r"\s*(?:▹ |(?:" + "|".join(map(re.escape, OUTCOMES.values())) + r"): )")
+LEAF_NAME  = re.compile(r"\s*(?:" + re.escape(TOOL) + "|(?:" + "|".join(map(re.escape, OUTCOMES.values())) + r"): )")
 LEAF_TYPES = ("p", "quote-block", "code-block")
 
 RETRIED, _lock = {}, threading.Lock()              # 재시도한 HTTP 상태 코드별 횟수 (doctor 가 병렬 읽기를 볼 때 쓴다)
@@ -139,10 +141,16 @@ def leaf(n):
     return (n.get("data") or {}).get("layoutMode") in LEAF_TYPES or bool(LEAF_NAME.match(n.get("name") or ""))
 
 
+def tool_run(n):
+    """API 가 돌려준 노드가 훅이 붙인 ▹ 도구 실행인가. 이어받는 트리에 넣지 않고, 읽은 노드 수에도 세지 않는다."""
+    return unhtml(n.get("name")).lstrip().startswith(TOOL)
+
+
 def subtree(root, limit=20.0, workers=8, progress=None):
     """root 아래 트리를 읽는다. root 의 자식(요청 목록)을 먼저 읽고, 최신 요청부터 그 하위를 병렬로 읽는다.
     limit 초(시간 한도)가 지나면 멈추고 읽은 만큼 돌려준다. 훅 timeout 에 걸려 통째로 잃지 않기 위해서다.
     limit 이 None 이면 끝까지 읽는다 (백그라운드 sync). progress(노드 수, 호출 수) 는 2초에 한 번쯤 불린다.
+    그 노드 수는 ▹ 도구 실행을 뺀 수다 — 이어받는 트리(from_api)가 ▹ 를 넣지 않으므로, sync 가 끝난 뒤 알리는 수와 맞춘다.
     root 의 자식을 읽지 못하면 예외를 그대로 올린다 (호출한 쪽이 로컬 기록으로 대체한다).
     돌려주는 값: nodes(API 노드. 트리 순서가 아니다), missing(자식을 읽지 못한 노드 id), times(성공한 호출별 초),
     errors(실패한 호출 수), seconds(전체 초).
@@ -151,6 +159,7 @@ def subtree(root, limit=20.0, workers=8, progress=None):
     end = None if limit is None else t0 + limit
     top = children(root)
     nodes, times, failed = list(top), [], []
+    kept = sum(1 for n in top if not tool_run(n))     # progress 에 알리는 노드 수 (▹ 제외)
     todo, done, stop = queue.PriorityQueue(), queue.Queue(), threading.Event()
     waiting = set()                              # 넣었지만 아직 결과를 받지 못한 노드
 
@@ -183,17 +192,18 @@ def subtree(root, limit=20.0, workers=8, progress=None):
         except (queue.Empty, ValueError):         # ValueError: 그 사이 한도가 지나 timeout 이 음수
             break
         waiting.discard(nid)
-        if progress and time.time() - shown >= 2:
-            shown = time.time()
-            progress(len(nodes), len(times) + len(failed) + 1)
         if isinstance(got, Exception):
             failed.append(nid)
-            continue
-        times.append(sec)
-        nodes += got
-        for c in got:
-            if not leaf(c):
-                put(rank, depth + 1, c)
+        else:
+            times.append(sec)
+            nodes += got
+            kept += sum(1 for c in got if not tool_run(c))
+            for c in got:
+                if not leaf(c):
+                    put(rank, depth + 1, c)
+        if progress and time.time() - shown >= 2:     # 방금 받은 자식까지 센 뒤에 알린다
+            shown = time.time()
+            progress(kept, len(times) + len(failed) + 1)
     stop.set()
     return {"nodes": nodes, "missing": failed + sorted(waiting), "times": times, "errors": len(failed),
             "seconds": time.time() - t0}

@@ -151,7 +151,7 @@ def from_api(root, t, local, mark=True):
 
     def walk(p):
         for n in ch.get(p, []):
-            if n["_name"].startswith("▹ "):
+            if wfapi.tool_run(n):
                 continue
             x = conv(n, p)
             out.append(x)
@@ -263,20 +263,24 @@ def progress_line(job):
 
 
 def start_sync(st, sid, spawn=None):
-    """prompt 훅: 백그라운드 sync 를 띄우고 곧바로 돌아온다. 이미 돌고 있으면 진행 상황만 알린다."""
+    """prompt 훅: 백그라운드 sync 를 띄우고 곧바로 돌아온다. 이미 돌고 있으면 진행 상황만 알린다.
+    앞 sync 의 결과를 아직 전하지 않았으면 그 글을 먼저 붙인다 — 작업 파일을 새 job 으로 바꾸면 사라지기 때문이다.
+    작업 파일은 한 번만 읽고 그것으로 판단한다 (따로 읽으면 그 사이 앞 sync 가 끝나 결과를 놓칠 수 있다)."""
     job = load_job(sid)
     if job_state(job) == "running":
-        return f"sync 가 이미 돌고 있다 ({progress_line(job)}). 끝나면 결과를 알린다."
+        return f"[workflowy] sync 가 이미 돌고 있다 ({progress_line(job)}). 끝나면 결과를 알린다."
+    say = [x for x in (news(job),) if x]
     save_job(sid, {"status": "running", "root": st["root"], "started": time.time(), "pid": None})
     try:
         (spawn or launch)(sid)
     except Exception as e:
         save_job(sid, {"status": "failed", "root": st["root"], "started": time.time(), "delivered": True})
-        return f"sync 를 시작하지 못했다 ({type(e).__name__}: {e}). 기록 상태는 그대로다."
-    return ("sync 를 백그라운드에서 시작했다: Workflowy 에서 root 아래 전체를 끝까지 읽는다 (시간 제한 없음). "
-            "끝나면 사용자의 다음 메시지나 workflowy 도구 결과 뒤에 결과를 알린다. 그 전까지는 지금 기록으로 일하고, "
-            "sync 결과(다른 PC 의 기록, Workflowy 에서 고친 내용)가 필요한 일은 결과가 온 뒤에 한다. "
-            "진행 상황은 /workflowy:workstream 로 볼 수 있다고 사용자에게 알린다.")
+        return "\n".join(say + [f"[workflowy] sync 를 시작하지 못했다 ({type(e).__name__}: {e}). 기록 상태는 그대로다."])
+    return "\n".join(say + [
+        "[workflowy] sync 를 백그라운드에서 시작했다: Workflowy 에서 root 아래 전체를 끝까지 읽는다 (시간 제한 없음). "
+        "끝나면 사용자의 다음 메시지나 workflowy 도구 결과 뒤에 결과를 알린다. 그 전까지는 지금 기록으로 일하고, "
+        "sync 결과(다른 PC 의 기록, Workflowy 에서 고친 내용)가 필요한 일은 결과가 온 뒤에 한다. "
+        "진행 상황은 /workflowy:workstream 로 볼 수 있다고 사용자에게 알린다."])
 
 
 def launch(sid):
@@ -354,17 +358,22 @@ def run_sync(sid, reader=None):
     save_job(sid, job)
 
 
-def sync_news(sid):
-    """아직 전하지 않은 sync 결과(끝남·실패·중단)가 있으면 그 글을 돌려주고 전한 것으로 표시한다."""
-    job = load_job(sid)
-    s = job_state(job)
-    if not job or job.get("delivered") or s == "running":
+def news(job):
+    """job 의 아직 전하지 않은 결과(끝남·실패·중단) 글. 없거나 아직 돌고 있으면 None."""
+    if not job or job.get("delivered") or job_state(job) == "running":
         return None
-    msg = job.get("message") or ("sync 프로세스가 결과 없이 멈췄다 (중단됨). 기록 상태는 그대로다. "
-                                 "필요하면 사용자에게 /workflowy:workstream sync 를 다시 권한다.")
-    job["delivered"] = True
-    save_job(sid, job)
-    return "[workflowy] " + msg
+    return "[workflowy] " + (job.get("message") or ("sync 프로세스가 결과 없이 멈췄다 (중단됨). 기록 상태는 그대로다. "
+                                                    "필요하면 사용자에게 /workflowy:workstream sync 를 다시 권한다."))
+
+
+def sync_news(sid):
+    """아직 전하지 않은 sync 결과가 있으면 그 글을 돌려주고 전한 것으로 표시한다."""
+    job = load_job(sid)
+    msg = news(job)
+    if msg:
+        job["delivered"] = True
+        save_job(sid, job)
+    return msg
 
 
 def sync_status(sid):
@@ -542,7 +551,7 @@ def h_prompt(ev, st, sid, arg):
     if a == "sync":
         if not st.get("root"):
             return "[workflowy] 기록 중인 세션이 없습니다. /workflowy:workstream <노드 id> 로 먼저 시작하세요."
-        return "[workflowy] " + start_sync(st, sid)
+        return start_sync(st, sid)
     if a == "doctor":
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -824,12 +833,13 @@ def check_tree(root, limit=LIMIT):
         t, via = wfapi.subtree(root, limit), "UUID"
     ns, times = t["nodes"], sorted(t["times"])
     top = [n for n in ns if short(n.get("parent_id")) == short(root)]
+    tools = [n for n in ns if wfapi.tool_run(n)]
     kinds = {}
     for n in ns:
         k = (n.get("data") or {}).get("layoutMode") or "(없음)"
         kinds[k] = kinds.get(k, 0) + 1
     retried = ", ".join(f"HTTP {c} {k}번" for c, k in sorted(wfapi.RETRIED.items())) or "없음"
-    print(f"  {'ok ' if not t['missing'] else 'WARN'} 트리 읽기    노드 {len(ns)}개 (요청 {len(top)}개), "
+    print(f"  {'ok ' if not t['missing'] else 'WARN'} 트리 읽기    노드 {len(ns)}개 (요청 {len(top)}개, ▹ 도구 실행 {len(tools)}개), "
           f"호출 {len(times) + t['errors'] + 1}번, {t['seconds']:.1f}초 (한도 {limit}초, {via})")
     if times:
         print(f"                   호출당 중앙값 {times[len(times) // 2]:.2f}초, 최대 {times[-1]:.2f}초")
@@ -844,7 +854,7 @@ def check_tree(root, limit=LIMIT):
             ("요청 note", top[-1] if top else None, "note"),
             ("코드 블록", next((n for n in ns if code(n)), None), "name"),
             ("인라인 코드", next((n for n in ns if has(n, "`", "<code>") and not code(n)), None), "name"),
-            ("▹ 기록", next((n for n in ns if has(n, "▹")), None), "name")):
+            ("▹ 기록", tools[0] if tools else None, "name")):
         if n:
             print(f"  --  원문         {label}: {raw(n.get(f))}")
 
@@ -903,7 +913,7 @@ def main():
         if lk:
             lk.unlink(missing_ok=True)
     if target:
-        try: wfapi.create(target, "▹ " + wfapi.label(d, 200))
+        try: wfapi.create(target, wfapi.TOOL + wfapi.label(d, 200))
         except Exception as e: log_error(mode, e)
     if say:                                      # UserPromptSubmit·SessionStart 의 stdout 은 Claude 의 컨텍스트가 된다
         print(say)

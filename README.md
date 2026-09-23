@@ -44,7 +44,8 @@ claude plugin install workflowy@j-ch-marketplace --config api_key=<WORKFLOWY_API
   노드마다 API 를 한 번씩 부르므로 시간이 걸린다 (병렬 8개. 노드 350개쯤이면 20초 남짓).
   그래서 **백그라운드에서 읽는다**: 훅은 프로세스를 띄우고 곧바로 끝나고(훅 timeout 과 무관, 시간 제한 없음),
   다 읽으면 결과가 사용자의 다음 메시지나 Claude 의 다음 workflowy 도구 결과 뒤에 한 번 전해진다.
-  도는 동안은 `/workflowy:workstream` 에 진행 상황(읽은 노드 수, 경과 시간)이 보인다.
+  도는 동안은 `/workflowy:workstream` 에 진행 상황(읽은 노드 수, 경과 시간)이 보인다. 노드 수에는 ▹ 도구 실행 노드를
+  세지 않으므로 끝난 뒤 알리는 수와 같은 기준이다. 결과를 전하기 전에 `sync` 를 다시 부르면 앞 결과를 먼저 전하고 새로 읽는다.
   호출이 실패한 부분은 이 PC 의 세션 상태로 채우고 `[하위 일부: 이 PC 기록]` 으로 표시하며, 그 노드 제목을 알린다.
 - 끝나지 않은 todo 가 있으면 Claude 는 혼자 닫지 않고 목록을 보여 주며 어떻게 할지 묻는다.
   그래서 Workflowy 에 todo 를 적어 두고 `sync` 하면 할 일로 넘길 수 있다.
