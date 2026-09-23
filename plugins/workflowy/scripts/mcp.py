@@ -9,17 +9,17 @@ mcp.py - Claude 가 Workflowy 작업 로그를 직접 쓰는 MCP 서버 (stdio, 
 import json, sys, urllib.error
 import wfapi
 
-VERSION = "2.0.1"
+VERSION = "3.0.0"
 
 INSTRUCTIONS = (
-    "사용자가 /workflowy:session-log <id> 로 기록을 시작한 세션에서만 쓴다. "
+    "사용자가 /workflowy:workstream <id> 로 기록을 시작한 세션에서만 쓴다. "
     "지정된 root 노드 자체는 건드리지 않고 그 아래에 노드를 추가만 한다.")
 
 TOOLS = [
     {"name": "create",
      "description": (
          "Workflowy 노드를 parent 의 맨 아래에 추가하고 id 와 url 을 돌려준다. "
-         "parent 는 기록 root 이거나 이 세션에서 create 로 만든 노드여야 한다. "
+         "parent 는 기록 root 이거나 이 세션에서 만들었거나 이어받은 노드여야 한다. "
          "type: bullets(일반 항목) | todo(체크할 작업, 끝나면 complete) | h1/h2/h3(구획 제목) | "
          "p(단락) | quote-block(인용) | code(코드·명령·로그, name 에 코드 원문). "
          "name 은 마크다운(**굵게**, `코드`, [링크](url))을 쓸 수 있다. "
@@ -28,7 +28,7 @@ TOOLS = [
      "inputSchema": {
          "type": "object",
          "properties": {
-             "parent": {"type": "string", "description": "부모 노드 id (root 의 short id 또는 create 가 돌려준 id)"},
+             "parent": {"type": "string", "description": "부모 노드 id (root 의 short id, create 가 돌려준 id, 기록 시작 때 받은 id)"},
              "name": {"type": "string", "description": "노드 제목. type=code 이면 코드 원문(여러 줄 가능)"},
              "type": {"type": "string", "enum": list(wfapi.TYPES), "default": "bullets"},
              "note": {"type": "string", "description": "제목 아래에 붙는 설명(여러 줄 가능). 마크다운은 그려지지 않는다"},
@@ -38,10 +38,10 @@ TOOLS = [
                                       "todo 가 아닌 노드에 true 를 주면 열린 todo 가 없을 때 도구 실행이 여기에 붙는다."}},
          "required": ["parent", "name"]}},
     {"name": "complete",
-     "description": "이 세션에서 create 로 만든 todo 를 완료 처리한다. 되돌리거나 다시 열 수 없다.",
+     "description": "이 세션에서 만들었거나 이어받은 todo 를 완료 처리한다. 되돌리거나 다시 열 수 없다.",
      "inputSchema": {
          "type": "object",
-         "properties": {"id": {"type": "string", "description": "create 가 돌려준 todo 의 id"}},
+         "properties": {"id": {"type": "string", "description": "todo 의 id (create 가 돌려줬거나 기록 시작 때 받은 id)"}},
          "required": ["id"]}},
 ]
 

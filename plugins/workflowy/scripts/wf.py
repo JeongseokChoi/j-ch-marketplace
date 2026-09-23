@@ -2,8 +2,8 @@
 """
 wf.py - workflowy 플러그인의 훅. 기록 내용은 Claude 가 MCP 도구(mcp.py)로 직접 쓰고, 훅은 그 주변을 맡는다.
 
-  prompt         UserPromptSubmit  /workflowy:session-log <id> | stop | doctor | (없음: 상태)
-  guard          PreToolUse        workflowy 도구 호출 검사 — root 아래, 이 세션이 만든 노드만 허용
+  prompt         UserPromptSubmit  /workflowy:workstream <id> | stop | doctor | (없음: 상태)
+  guard          PreToolUse        workflowy 도구 호출 검사 — root 아래, 이 세션이 만들었거나 이어받은 노드만 허용
   track          PostToolUse       workflowy 도구가 만든 노드·완료를 세션 상태에 기록
   step           PreToolUse        그 밖의 도구 실행을 지금 작업 중인 노드 아래에 자동으로 붙인다
   session-start  SessionStart      resume/compact 뒤 기록 중이라는 사실과 노드 구조를 다시 알려준다
@@ -19,7 +19,7 @@ from wfapi import short
 DATA   = os.environ.get("CLAUDE_PLUGIN_DATA")
 STATE  = pathlib.Path(DATA) if DATA else None       # 업데이트에도 보존되는 플러그인 데이터 영역
 ERRLOG = STATE / "error.log" if STATE else None
-SKILL  = re.compile(r"^/(?:workflowy:)?session-log\b\s*(.*)$", re.S)   # 사용자가 직접 입력한 스킬
+SKILL  = re.compile(r"^/(?:workflowy:)?workstream\b\s*(.*)$", re.S)    # 사용자가 직접 입력한 스킬
 TOOL   = "mcp__plugin_workflowy_workflowy__"          # 플러그인 MCP 서버 도구 이름의 접두사
 # Claude Code 가 스스로 넣는 턴(에이전트 보고, 완료 알림 등). source 필드가 없는 버전은 내용으로 판단한다.
 SYSTEM = re.compile(r"\s*(<(agent-message|task-notification|system-reminder|local-command-caveat)\b"
@@ -57,6 +57,42 @@ def lock(sid):
     return None
 
 
+def archive(sid, st):
+    """상태 파일을 지우지 않고 <sid>.<시각>.json 으로 남긴다. 나중에 같은 root 로 시작한 세션이 이어받는다."""
+    p = spath(sid)
+    if st.get("nodes"):
+        p.replace(p.with_name(f"{sid}.{int(time.time() * 1000)}.json"))
+    else:
+        p.unlink(missing_ok=True)
+
+
+def inherit(sid, root):
+    """다른 세션들(멈춘 세션 포함)이 같은 root 에 쓴 노드와 그 세션 수.
+    create 는 늘 맨 아래에 붙이므로 만든 시각 순이 곧 문서 순서다. 시각이 없는 노드는 그 세션의 시작 시각으로 본다.
+    이어받은 세션도 그 노드를 갖고 있으므로 한 노드가 여러 파일에 있을 수 있다. 어느 쪽이든 완료했으면 완료."""
+    got, sids = [], set()
+    for p in (STATE / "state").glob("*.json"):
+        if p == spath(sid):
+            continue
+        try:    o = json.loads(p.read_text(encoding="utf-8"))
+        except Exception: continue
+        if short(o.get("root")) != short(root) or not o.get("nodes"):
+            continue
+        sids.add(p.name.split(".")[0])
+        t0 = o.get("started") or 0
+        got += [(n.get("t", t0), t0, i, n) for i, n in enumerate(o["nodes"])]
+    out, seen = [], {}
+    for t, _, _, n in sorted(got, key=lambda g: g[:3]):
+        k = short(n["id"])
+        if k in seen:
+            if n.get("done"):
+                seen[k]["done"] = True
+            continue
+        seen[k] = dict(n, t=t, old=True)
+        out.append(seen[k])
+    return out, len(sids)
+
+
 def norm(s): return " ".join(str(s or "").split())
 
 
@@ -71,7 +107,9 @@ def kids(st):
 def focus(st):
     """도구 실행을 붙일 노드. 트리 순서로 첫 번째 열린 todo 에서 시작해 그 아래 열린 todo 로 끝까지 내려간다.
     Phase 를 한꺼번에 만들어 두어도 지금 하는 Phase(그 안의 지금 하는 작업)에 붙는다.
-    열린 todo 가 없으면 steps=true 로 만든 노드나 제목 중 마지막 것."""
+    열린 todo 가 없으면 steps=true 로 만든 노드나 제목 중 마지막 것.
+    이어받은 노드는 고르지 않는다. 새 요청 제목을 만들기 전의 도구 실행이 이전 세션의 기록에 섞이지 않게 한다.
+    이어받은 열린 todo 의 아래에 이 세션이 만든 todo 는 고른다."""
     ch = kids(st)
 
     def walk(p):
@@ -79,7 +117,10 @@ def focus(st):
             if n["type"] == "todo":
                 if n.get("done") or not n.get("steps", True):
                     continue
-                return walk(short(n["id"])) or n
+                r = walk(short(n["id"]))
+                if r or not n.get("old"):
+                    return r or n
+                continue
             r = walk(short(n["id"]))
             if r:
                 return r
@@ -88,7 +129,7 @@ def focus(st):
     f = walk(short(st.get("root")))
     if f:
         return f
-    rest = [n for n in st.get("nodes") or [] if n["type"] != "todo"
+    rest = [n for n in st.get("nodes") or [] if n["type"] != "todo" and not n.get("old")
             and (n.get("steps") is True or (n["type"] in HEADS and n.get("steps") is not False))]
     return rest[-1] if rest else None
 
@@ -98,29 +139,61 @@ def find(st, nid):
     return next((n for n in st.get("nodes") or [] if short(n["id"]) == s), None) if s else None
 
 
+def line(n, depth=0):
+    mark = ("✓ " if n.get("done") else "☐ ") if n["type"] == "todo" else ""
+    return f"{'  ' * depth}- {mark}[{n['type']}] {n['name']}  (id: {short(n['id'])})"
+
+
+def lines(st, top=None, depth=0):
+    """top(없으면 root) 아래 노드를 트리 순서로 한 줄씩."""
+    ch, out = kids(st), []
+
+    def walk(p, d):
+        for n in ch.get(p, []):
+            out.append(line(n, d))
+            walk(short(n["id"]), d + 1)
+
+    walk(short(top or st.get("root")), depth)
+    return out
+
+
+def tail(ls, limit):
+    return [f"… 앞의 {len(ls) - limit}줄 생략"] + ls[-limit:] if len(ls) > limit else ls
+
+
 def tree(st, limit=80):
     """Claude 가 이어서 쓸 수 있도록 지금까지 만든 노드를 id 와 함께 보여준다."""
-    ch, lines = kids(st), []
+    return "\n".join(tail(lines(st), limit)) or "(아직 만든 노드 없음)"
 
-    def walk(p, depth):
-        for n in ch.get(p, []):
-            mark = ("✓ " if n.get("done") else "☐ ") if n["type"] == "todo" else ""
-            lines.append(f"{'  ' * depth}- {mark}[{n['type']}] {n['name']}  (id: {short(n['id'])})")
-            walk(short(n["id"]), depth + 1)
 
-    walk(short(st.get("root")), 0)
-    if len(lines) > limit:
-        lines = [f"… 앞의 {len(lines) - limit}줄 생략"] + lines[-limit:]
-    return "\n".join(lines) or "(아직 만든 노드 없음)"
+def outline(st, limit=80):
+    """tree 와 같되, 여러 세션이 쌓여 길어지면 root 바로 아래 항목(요청), 열린 todo, 마지막 항목의 하위만 보여준다."""
+    ls = lines(st)
+    if len(ls) <= limit:
+        return "\n".join(ls) or "(아직 만든 노드 없음)"
+    root, byid = short(st["root"]), {short(n["id"]): n for n in st["nodes"]}
+    top = kids(st).get(root, [])
+
+    def under(n):                                # n 이 들어 있는 root 바로 아래 항목
+        while n["parent"] != root and n["parent"] in byid:
+            n = byid[n["parent"]]
+        return n
+
+    out = [f"root 바로 아래 {len(top)}개 (오래된 순):"] + tail([line(n) for n in top], 30)
+    todo = [n for n in st["nodes"] if n["type"] == "todo" and not n.get("done")]
+    if todo:
+        out += ["열린 todo:"] + [f"{line(n)}  ← {under(n)['name']}" for n in todo]
+    out += [f"마지막 항목 '{top[-1]['name']}' 의 하위:"] + tail(lines(st, top[-1]["id"], 1), 40)
+    return "\n".join(out)
 
 
 def summary(st):
     f = focus(st)
     return (f"기록 root: '{st.get('root_name')}' {wfapi.url(st['root'])}  (root id: {short(st['root'])})\n"
             f"지금 도구 실행이 붙는 노드: {f['name'] + ' (id: ' + short(f['id']) + ')' if f else '없음'}\n"
-            f"지금까지 만든 노드:\n{tree(st)}")
+            f"지금까지 쓴 노드:\n{outline(st)}")
 
-# ----------------------------------------------------------------- /workflowy:session-log
+# ----------------------------------------------------------------- /workflowy:workstream
 
 
 REMIND = ("[workflowy] 이 세션은 Workflowy 에 기록 중이다. 이 요청도 진행하는 대로 root 아래에 정리해 쓴다 "
@@ -138,8 +211,9 @@ def h_prompt(ev, st, sid, arg):
     if a == "stop":
         if not st.get("root"):
             return "[workflowy] 기록 중인 세션이 없습니다."
-        spath(sid).unlink(missing_ok=True)
-        return "[workflowy] 기록을 멈췄습니다. 이미 쓴 노드는 그대로 둡니다. 이 세션에서는 더 이상 workflowy 도구를 쓰지 않는다."
+        archive(sid, st)
+        return ("[workflowy] 기록을 멈췄습니다. 이미 쓴 노드는 그대로 두고, 다음에 같은 노드로 시작하면 이어받습니다. "
+                "이 세션에서는 더 이상 workflowy 도구를 쓰지 않는다.")
     if a == "doctor":
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -148,7 +222,7 @@ def h_prompt(ev, st, sid, arg):
     s = short(a.split()[0])
     if not s:
         return (f"[workflowy] '{a}' 는 노드 id 가 아닙니다. Workflowy URL 끝 12자리나 URL 을 주세요 "
-                "(예: /workflowy:session-log daa0961ddeee).")
+                "(예: /workflowy:workstream daa0961ddeee).")
     if st.get("root") and short(st["root"]) == s:
         return "[workflowy] 이미 이 노드에 기록 중입니다.\n" + summary(st)
     try:
@@ -157,14 +231,24 @@ def h_prompt(ev, st, sid, arg):
         return "[workflowy] 기록을 시작하지 못했습니다: " + {
             401: "API key 가 잘못됨", 403: "권한 없음", 404: f"노드 {s} 를 찾을 수 없음"}.get(e.code, f"HTTP {e.code}")
     prev = st.get("root_name")
+    if st.get("root"):
+        archive(sid, st)
+    old, k = inherit(sid, n["id"])
     st.clear()
     st.update(root=n["id"], root_name=norm(n.get("name"))[:80] or "(제목 없음)",
-              started=time.time(), cwd=ev.get("cwd"), nodes=[])
+              started=time.time(), cwd=ev.get("cwd"), nodes=old)
     save(sid, st)
     out = (f"[workflowy] 기록 시작: '{st['root_name']}' {wfapi.url(n['id'])}\n"
            f"root id: {s} — 이 노드 자체는 건드리지 않고, 그 아래에 workflowy create 도구로 쓴다.")
     if prev:
         out += f"\n(이전에 기록하던 '{prev}' 대신 이 노드에 기록한다. 이전 노드들은 parent 로 쓸 수 없다.)"
+    if old:
+        out += (f"\n이전 세션 {k}개가 이 노드에 쓴 노드 {len(old)}개를 이어받았다. "
+                "먼저 아래 내용으로 지금까지의 흐름을 파악한다. 이어받은 노드 아래에도 쓸 수 있고, 이어받은 todo 도 complete 할 수 있다.\n"
+                + outline(st))
+        if any(x["type"] == "todo" and not x.get("done") for x in old):
+            out += ("\n열린 todo 가 남아 있다. 이미 끝났으면 결과를, 하지 않을 일이면 `취소: 이유` 를 그 아래에 쓰고 complete 한다. "
+                    "이어서 할 일이면 그대로 둔다.")
     err = new_errors()
     if err:
         out += f"\n[workflowy] 지난 확인 이후 기록 오류 {len(err)}건. 마지막: {err[-1]} — 사용자에게 알린다."
@@ -184,18 +268,18 @@ def h_guard(ev, st):
     if ev.get("agent_id"):
         return decide(False, "Workflowy 기록은 메인 세션만 한다. 서브에이전트는 결과를 보고만 한다.")
     if not st.get("root"):
-        return decide(False, "이 세션은 Workflowy 에 기록 중이 아니다. 사용자가 /workflowy:session-log <id> 로 시작해야 쓸 수 있다.")
+        return decide(False, "이 세션은 Workflowy 에 기록 중이 아니다. 사용자가 /workflowy:workstream <id> 로 시작해야 쓸 수 있다.")
     i, tool = ev.get("tool_input") or {}, ev.get("tool_name", "")[len(TOOL):]
     if tool == "create":
         p = short(i.get("parent"))
         if p and (p == short(st["root"]) or find(st, p)):
             return decide(True)
-        return decide(False, f"parent 는 기록 root({short(st['root'])}) 이거나 이 세션에서 create 로 만든 노드여야 한다. "
-                             "지금까지 만든 노드:\n" + tree(st, 30))
+        return decide(False, f"parent 는 기록 root({short(st['root'])}) 이거나 이 세션에서 만들었거나 이어받은 노드여야 한다. "
+                             "지금까지 쓴 노드:\n" + tree(st, 30))
     if tool == "complete":
         n = find(st, i.get("id"))
         if not n:
-            return decide(False, "이 세션에서 create 로 만든 todo 만 완료 처리할 수 있다 (root 와 기존 노드는 건드리지 않는다).")
+            return decide(False, "이 세션에서 만들었거나 이어받은 todo 만 완료 처리할 수 있다 (root 와 그 밖의 노드는 건드리지 않는다).")
         if n["type"] != "todo":
             return decide(False, f"'{n['name']}' 은 todo 가 아니다 ({n['type']}).")
         if n.get("done"):
@@ -217,7 +301,7 @@ def h_track(ev, st, sid):
     if tool == "create":
         t = i.get("type") or "bullets"
         name = norm(str(i.get("name") or "").split("\n")[0]) if t != "code" else "(코드)"
-        st["nodes"].append({"id": m.group(1), "parent": short(i.get("parent")), "type": t,
+        st["nodes"].append({"id": m.group(1), "parent": short(i.get("parent")), "type": t, "t": time.time(),
                             "name": name[:60] + ("…" if len(name) > 60 else ""),
                             **({"steps": bool(i["steps"])} if "steps" in i else {})})
     elif tool == "complete":
@@ -262,7 +346,7 @@ def h_step(ev, st, sid, d):
 def h_session_start(ev, st):
     if not st.get("root"):
         return None
-    return ("[workflowy] 이 세션은 Workflowy 에 작업 기록 중이다 (/workflowy:session-log 스킬의 지침을 계속 따른다).\n"
+    return ("[workflowy] 이 세션은 Workflowy 에 작업 기록 중이다 (/workflowy:workstream 스킬의 지침을 계속 따른다).\n"
             "- 지금 하는 작업은 workflowy create 도구로 root 아래에 정리해 쓰고, todo 는 끝나는 대로 complete 한다.\n"
             "- 도구 실행은 훅이 열린 todo 아래에 자동으로 붙인다. 도구의 description 은 명사형으로 짧게 쓴다.\n"
             "- 이미 쓴 노드는 고치거나 지우지 않고, 새 노드를 추가만 한다.\n" + summary(st))
@@ -310,8 +394,9 @@ def do_doctor(st):
             print(f"  FAIL API 연결     {code}"); ok = False
         except Exception as e:
             print(f"  FAIL API 연결     {type(e).__name__}: {e}"); ok = False
-    print(f"  --  기록 상태    " + (f"'{st['root_name']}' 에 기록 중, 만든 노드 {len(st['nodes'])}개"
-                                  if st.get("root") else "기록 중 아님"))
+    old = sum(1 for n in st.get("nodes") or [] if n.get("old"))
+    print(f"  --  기록 상태    " + (f"'{st['root_name']}' 에 기록 중, 만든 노드 {len(st['nodes']) - old}개"
+                                  + (f", 이어받은 노드 {old}개" if old else "") if st.get("root") else "기록 중 아님"))
 
     if ERRLOG.exists() and ERRLOG.stat().st_size:
         print(f"\n  주의: {ERRLOG} 에 기록된 오류가 있습니다 (마지막 5줄)")
@@ -340,7 +425,7 @@ def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if not STATE:
         print("[workflowy] 플러그인 훅 밖에서 실행되어 API key 와 기록 상태를 쓸 수 없습니다.\n"
-              "점검은 /workflowy:session-log doctor 로 하세요.", file=sys.stderr)
+              "점검은 /workflowy:workstream doctor 로 하세요.", file=sys.stderr)
         sys.exit(1)
     try: ev = json.loads(sys.stdin.read() or "{}")
     except Exception: ev = {}
