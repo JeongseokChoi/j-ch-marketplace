@@ -684,7 +684,8 @@ def summary(st, sid=None):
 REMIND = ("[workflowy] 이 세션은 Workflowy 에 기록 중이다. 이 요청도 진행하는 대로 root 아래에 정리해 쓴다 "
           "(새 요청은 root 아래에 request: true, 단계는 todo, 단계의 발견·결과는 그 todo 아래에 쓰고 close. "
           "하지 않은 todo 는 done 으로 닫지 않는다). "
-          "도구 description 은 사용자의 언어로, 명사형으로 짧게 쓴다 — 그대로 기록된다.")
+          "도구 description 은 사용자의 언어로, 명사형으로 짧게 쓴다 — 그대로 기록된다. "
+          "병렬 subagent 처럼 동시에 진행하는 일은 description 끝에 @<todo id> 를 붙여 그 todo 아래에 붙인다.")
 
 
 def clear_cache(st, sid):
@@ -1041,8 +1042,12 @@ def sent(parent, name, type="bullets", note=None, request=False):
 # ----------------------------------------------------------------- 도구 실행 자동 기록
 
 
+AT = re.compile(r"\s*@([0-9a-f-]{12,36})$", re.I)   # description 끝의 @<todo id>: 그 todo 아래에 붙인다
+
+
 def step_of(ev):
-    """붙일 문구. 없으면 None. 모든 도구마다 불리므로 상태 없이 판단한다."""
+    """(붙일 문구, description 끝에 @ 로 준 todo 의 short id 또는 None). 없으면 None.
+    모든 도구마다 불리므로 상태 없이 판단한다."""
     if ev.get("agent_id"):
         return None                              # 서브에이전트가 부른 도구는 메인 세션의 단계가 아니다
     name = ev.get("tool_name") or ""
@@ -1051,17 +1056,22 @@ def step_of(ev):
     i = ev.get("tool_input") if isinstance(ev.get("tool_input"), dict) else {}
     if name in ("Edit", "Write", "NotebookEdit"):
         f = i.get("file_path") or i.get("notebook_path")
-        return f"{'작성' if name == 'Write' else '편집'} · {pathlib.Path(f).name}" if f else None
+        return (f"{'작성' if name == 'Write' else '편집'} · {pathlib.Path(f).name}", None) if f else None
     d = norm(i.get("description"))
+    m = AT.search(d)
+    d = d[:m.start()] if m else d                # @id 는 기록에 남기지 않는다
     if not d:
         return None
-    return ("\U0001f916 " if name in ("Agent", "Task") else "") + d
+    return ("\U0001f916 " if name in ("Agent", "Task") else "") + d, m and short(m.group(1))
 
 
-def h_step(ev, st, sid, d):
+def h_step(ev, st, sid, d, want=None):
+    """붙일 노드의 id. @ 로 준 todo 가 이 세션이 만든 열린 todo 이면 그 todo, 아니면 focus.
+    병렬 subagent 처럼 동시에 진행되는 일은 focus 하나로 나눠 담을 수 없어 모델이 호출마다 정한다."""
     if not st.get("root"):
         return None
-    f = focus(st)
+    n = find(st, want) if want else None
+    f = n if n and is_open(n) and not n.get("old") else focus(st)
     if not f or st.get("last_step") == [f["id"], d]:
         return None                              # 같은 노드에 같은 문구가 이어지면 한 번만
     st["last_step"] = [f["id"], d]
@@ -1078,7 +1088,8 @@ def h_session_start(ev, st):
             "- 지금 하는 작업은 workflowy create 도구로 root 아래에 정리해 쓰고 (새 요청은 request: true), "
             "todo 는 끝나는 대로 close 한다 "
             "(끝냄 done · 안 함 cancel · 방법 바뀜 replace · 미룸 hold).\n"
-            "- 도구 실행은 훅이 열린 todo 아래에 자동으로 붙인다. 도구의 description 은 명사형으로 짧게 쓴다.\n"
+            "- 도구 실행은 훅이 열린 todo 아래에 자동으로 붙인다. 도구의 description 은 명사형으로 짧게 쓴다. "
+            "동시에 진행하는 일(병렬 subagent 등)은 description 끝에 @<todo id> 를 붙여 그 todo 아래에 붙인다.\n"
             "- 이미 쓴 노드는 고치거나 지우지 않고, 새 노드를 추가만 한다.\n" + summary(st, ev.get("session_id"))
             + ("\n" + (sync_news(ev.get("session_id")) or "")).rstrip())
 
@@ -1210,7 +1221,7 @@ def main():
 
     # 모든 요청·도구마다 불리는 훅은 할 일이 없으면 잠금도 잡지 않고 끝낸다
     m = SKILL.match((ev.get("prompt") or "").strip()) if mode == "prompt" else None
-    d = step_of(ev) if mode == "step" else None
+    d, want = (step_of(ev) if mode == "step" else None) or (None, None)
     if (mode == "step" and not d) or \
        ((mode in ("step", "session-start") or (mode == "prompt" and not m)) and not spath(sid).exists()):
         sys.exit(0)
@@ -1224,7 +1235,7 @@ def main():
         elif mode == "track":
             h_track(ev, st, sid)
             ctx = None if ev.get("agent_id") else sync_news(sid)     # 끝난 sync 결과는 도구 결과 뒤에 붙여 전한다
-        elif mode == "step":          target = h_step(ev, st, sid, d)
+        elif mode == "step":          target = h_step(ev, st, sid, d, want)
         elif mode == "session-start": say = h_session_start(ev, st)
     except Exception as e:
         log_error(mode, e)

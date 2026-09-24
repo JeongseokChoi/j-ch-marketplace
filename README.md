@@ -145,6 +145,10 @@ Claude 가 내용에 맞는 노드 타입을 골라 쓴다. 따로 정하지 않
 열린 todo 가 없으면 이 세션에서 마지막으로 만든 요청이다. 이어받은 노드에는 붙이지 않는다. description 이 없는 읽기 도구(Read·Grep 등)와
 서브에이전트가 부른 도구는 붙이지 않는다. 서브에이전트는 기록하지 않고, 메인 세션이 결과를 정리한다.
 
+지금 작업 중인 노드는 하나라서 병렬 subagent 처럼 **동시에 진행하는 일**은 나눠 담지 못한다. 그래서 Claude 가
+description 끝에 `@<todo id>` 를 붙이면(예: `사이클 B 가설 수립 @29fd1e4a09dc`) 훅이 그 todo 아래에 붙이고 `@…` 는 기록에서 뗀다.
+이 세션에서 만든 열린 todo 가 아니면 지금 작업 중인 노드에 붙는다. description 이 없는 Edit·Write 는 늘 지금 작업 중인 노드에 붙는다.
+
 ### todo 닫기
 
 Claude 는 todo 를 `close` 도구로 닫으면서 어떻게 닫는지 고른다. 하지 않은 일이 '완료' 로 남지 않게 하려는 것이다.
@@ -213,7 +217,7 @@ Claude 는 todo 를 `close` 도구로 닫으면서 어떻게 닫는지 고른다
 | MCP 서버 `workflowy` (`scripts/mcp.py`) | Claude 가 쓰는 도구 `create`(노드 추가. `request: true` 면 요청 노드), `close`(todo 닫기: 완료·취소·방향 전환·보류), `read`(본문 읽기. 데이터 폴더의 cache·state 를 읽기만 한다). 수정·삭제 도구는 없다 |
 | PreToolUse 훅 `guard` | 기록 중인 세션의 메인 Claude 가, root 또는 이 세션에서 만들었거나 이어받은 노드 아래에만 쓰도록 검사. root 바로 아래는 요청만. todo 를 닫을 때 결과·이유·하위 todo 도 검사. `read` 도 같은 범위만. 범위 안이면 권한 확인 없이 허용 |
 | PostToolUse 훅 `track` | 만든 노드와 닫은 todo(보류 포함, 닫은 시각)를 state 에 기록. 끝난 `sync` 결과가 있으면 도구 결과 뒤에 덧붙여 전함 |
-| PreToolUse 훅 `step` | 도구 실행을 지금 작업 중인 노드 아래에 `▹` 로 추가 |
+| PreToolUse 훅 `step` | 도구 실행을 지금 작업 중인 노드(description 끝에 `@<todo id>` 가 있으면 그 todo) 아래에 `▹` 로 추가 |
 | UserPromptSubmit 훅 `prompt` | `/workflowy:workstream` 인자 처리와 이어받기(시작 때 요청 목록 읽기, `sync` 때 백그라운드 프로세스 띄우기, `clear-cache` 때 cache 비우기). 기록 중이면 요청마다 기록 지침을 한 줄로 상기하고, 끝난 `sync` 결과를 전함 |
 | 백그라운드 `wf.py sync-run` | `sync` 가 띄우는 분리된 프로세스. root 아래 전체를 끝까지 읽어 cache 를 통째로 바꾸고, 잠금을 잠깐 잡아 state 에 합친 뒤 결과를 남김 |
 | SessionStart 훅 | 대화 압축·재개 뒤 기록 중인 root 와 지금까지 만든 노드(id 포함)를 Claude 에게 다시 알림 |
@@ -242,6 +246,8 @@ Claude 는 todo 를 `close` 도구로 닫으면서 어떻게 닫는지 고른다
 4.0 은 3.7 에서 생긴 `/workflowy:snapshot` 의 이름을 `/workflowy:look-tree` 로 바꿨다 (위 **노드 보기**). 동작은 같고,
 옛 이름은 더 받지 않는다. workstream 은 바뀌지 않았다.
 4.0.1 은 `/look-tree` 로 줄여 부르면 `Unknown command` 가 나던 것을 고쳤다 (description 의 콜론이 frontmatter 를 깨뜨렸다).
+4.1 부터 도구의 description 끝에 `@<todo id>` 를 붙이면 그 도구 실행을 그 todo 아래에 붙인다 (위 **기록되는 구조**).
+병렬 subagent 의 기록이 트리 순서로 첫 열린 todo 에 몰리던 것을 트랙마다 나눠 담을 수 있다. `@` 가 없으면 전과 같다.
 
 ### 2.x 에서 옮겨 오기
 
