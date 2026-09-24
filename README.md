@@ -183,8 +183,9 @@ Claude 는 todo 를 `close` 도구로 닫으면서 어떻게 닫는지 고른다
 - **읽기만 한다.** Workflowy 에 쓰지 않고 workstream 의 cache·state 도 바꾸지 않는다 (기록에 쓸 트리를 새로 받는 것은 `sync`).
   기록 중이 아니어도 되고 어떤 노드든 된다. 읽는 것은 그 노드와 하위뿐이다.
 - **사용자만 부른다.** Claude 는 이 스킬을 부를 수 없다 (`disable-model-invocation`). 읽기는 사용자가 친 명령을 받은 훅만
-  시작하고, Claude 의 Bash 에는 API key 가 없다. 훅은 `/look-tree` 처럼 접두사 없이 친 것도 받는다
+  시작하고, Claude 의 Bash 에는 API key 가 없다. `/look-tree` 처럼 접두사 없이 쳐도 된다
   (그래서 다른 plugin 의 명령과 겹치지 않게 흔한 `look` 대신 `look-tree` 로 했다).
+  SKILL.md 의 frontmatter 값에 `: ` (콜론+공백)을 넣지 않는다 — frontmatter 를 못 읽으면 짧은 이름이 등록되지 않는다.
 - **백그라운드에서 읽는다.** 훅은 프로세스를 띄우고 곧바로 끝난다 (훅 timeout 과 무관). 읽기는 `sync` 와 같다: 병렬 8개, 끝까지,
   요청 한도(429)에는 모두 멈춰 기다린다. Claude 는 훅이 알려 준 `wait` 명령을 Bash 백그라운드로 실행해 두고, 끝나면 결과를 받아
   요청을 이어서 한다. `wait` 를 부르지 않았으면 결과는 사용자의 다음 메시지 뒤에 한 번 전해진다. 끝나기 전에는 파일이 없다.
@@ -240,6 +241,7 @@ Claude 는 todo 를 `close` 도구로 닫으면서 어떻게 닫는지 고른다
 
 4.0 은 3.7 에서 생긴 `/workflowy:snapshot` 의 이름을 `/workflowy:look-tree` 로 바꿨다 (위 **노드 보기**). 동작은 같고,
 옛 이름은 더 받지 않는다. workstream 은 바뀌지 않았다.
+4.0.1 은 `/look-tree` 로 줄여 부르면 `Unknown command` 가 나던 것을 고쳤다 (description 의 콜론이 frontmatter 를 깨뜨렸다).
 
 ### 2.x 에서 옮겨 오기
 

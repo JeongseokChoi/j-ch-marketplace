@@ -9,7 +9,7 @@ mcp.py - Claude 가 Workflowy 작업 로그를 직접 쓰는 MCP 서버 (stdio, 
 import json, os, pathlib, sys, urllib.error
 import wfapi, wf
 
-VERSION = "4.0.0"
+VERSION = "4.0.1"
 
 # 데이터 폴더: plugin.json 이 env 로 넘기는 WORKFLOWY_DATA, 없으면 Claude Code 가 넘기는 CLAUDE_PLUGIN_DATA.
 # 치환되지 않은 ${...} 는 없는 것으로 본다. 없으면 read 가 그렇다고 알린다.
