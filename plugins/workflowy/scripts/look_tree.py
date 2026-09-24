@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-snapshot.py - /workflowy:snapshot <id>: Workflowy 노드 하나와 그 하위 전체를 읽어 scratchpad 에 텍스트 파일로 저장한다.
+look_tree.py - /workflowy:look-tree <id>: Workflowy 노드 하나와 그 하위 전체를 읽어 scratchpad 에 텍스트 파일로 저장한다.
 읽기만 한다. sync 처럼 훅은 백그라운드 프로세스를 띄우고 곧바로 끝난다 (훅 timeout 과 무관하게 끝까지 읽는다).
 
-  (인자 없음)  UserPromptSubmit 훅: /workflowy:snapshot <id> 면 run 을 띄운다. 끝났는데 전하지 않은 결과가 있으면 전한다
+  (인자 없음)  UserPromptSubmit 훅: /workflowy:look-tree <id> 면 run 을 띄운다. 끝났는데 전하지 않은 결과가 있으면 전한다
   run <job>    백그라운드: <id> 와 하위 전체를 읽어 저장하고 결과를 작업 파일에 적는다.
                API key 는 훅에서 물려받는다 — Claude 의 Bash 에는 key 가 없어 Claude 는 읽기를 시작할 수 없다
   wait <job>   Claude 가 Bash 백그라운드로 실행한다: 작업이 끝날 때까지 기다렸다 결과를 출력한다 (Workflowy 를 부르지 않는다)
 
-작업 파일은 데이터 폴더의 snapshot/<session id>-<short id>.json 이다. 결과를 전하면 지운다.
+작업 파일은 데이터 폴더의 look-tree/<session id>-<short id>.json 이다. 결과를 전하면 지운다.
 노드는 Workflowy API 가 준 값만으로 적는다. 읽는 트리에 무엇이 있을지 모르므로 workstream 의 규칙
 (wf.py 의 from_api·line 등)은 쓰지 않는다. wf 에서는 파일·프로세스 도우미(put·job_state)만 가져다 쓴다.
 """
@@ -18,15 +18,15 @@ import wfapi
 from wfapi import short
 from wf import DATA_DIR, put, job_state
 
-CMD    = re.compile(r"^/(?:workflowy:)?snapshot\b\s*(.*)$", re.S)    # 사용자가 직접 입력한 스킬
+CMD    = re.compile(r"^/(?:workflowy:)?look-tree(?![\w-])\s*(.*)$", re.S)    # 사용자가 직접 친 스킬 (접두사 없이도)
 REASON = {401: "API key 가 잘못됨", 403: "권한 없음", 404: "노드를 찾을 수 없음"}
 
 
-def jpath(sid, s): return DATA_DIR / "snapshot" / f"{sid}-{s}.json"
+def jpath(sid, s): return DATA_DIR / "look-tree" / f"{sid}-{s}.json"
 
 
 def jobs(sid):
-    return sorted((DATA_DIR / "snapshot").glob(f"{sid}-*.json")) if DATA_DIR else []
+    return sorted((DATA_DIR / "look-tree").glob(f"{sid}-*.json")) if DATA_DIR else []
 
 
 def load(job):
@@ -49,17 +49,17 @@ def hook(ev):
 def start(sid, arg, folder):
     s = short((arg.split() or [""])[0])
     if not s:
-        return ("[workflowy] snapshot: 노드 id 가 없거나 형식이 아니다. /workflowy:snapshot <노드 id 또는 URL> 로 부른다 "
+        return ("[workflowy] look-tree: 노드 id 가 없거나 형식이 아니다. /workflowy:look-tree <노드 id 또는 URL> 로 부른다 "
                 "(URL 끝 12자리, URL, 전체 UUID).")
     if not DATA_DIR:
-        return "[workflowy] snapshot: 데이터 폴더를 몰라 시작하지 못했다 (플러그인을 다시 설치하거나 /workflowy:workstream doctor 로 점검한다)."
+        return "[workflowy] look-tree: 데이터 폴더를 몰라 시작하지 못했다 (플러그인을 다시 설치하거나 /workflowy:workstream doctor 로 점검한다)."
     job = jpath(sid, s)
     j = load(job)
     if job_state(j) == "running":
-        return (f"[workflowy] snapshot: 노드 {s} 를 이미 읽는 중이다 ({int(time.time() - j.get('started', time.time()))}초째). "
+        return (f"[workflowy] look-tree: 노드 {s} 를 이미 읽는 중이다 ({int(time.time() - j.get('started', time.time()))}초째). "
                 "끝나면 알린다.\n" + how_to_wait(job))
     # scratchpad 가 없는 세션(훅 입력에 scratchpad_dir 가 없다)은 OS 임시 폴더 아래 세션마다 따로 둔다
-    base = pathlib.Path(folder) if folder else pathlib.Path(tempfile.gettempdir()) / "workflowy-snapshot" / (sid or "session")
+    base = pathlib.Path(folder) if folder else pathlib.Path(tempfile.gettempdir()) / "workflowy-look-tree" / (sid or "session")
     out = base / f"workflowy-{s}.md"
     try:
         out.unlink(missing_ok=True)                          # 끝나기 전에 옛 파일을 새 결과로 알고 읽지 않게
@@ -67,8 +67,8 @@ def start(sid, arg, folder):
         spawn(job)
     except Exception as e:
         job.unlink(missing_ok=True)
-        return f"[workflowy] snapshot 을 시작하지 못했다 ({type(e).__name__}: {e})."
-    return (f"[workflowy] snapshot 시작: 노드 {s} 와 그 하위 전체를 백그라운드에서 읽는다. "
+        return f"[workflowy] look-tree 을 시작하지 못했다 ({type(e).__name__}: {e})."
+    return (f"[workflowy] look-tree 시작: 노드 {s} 와 그 하위 전체를 백그라운드에서 읽는다. "
             f"끝나면 {out} 에 저장된다 (그 전에는 파일이 없다).\n" + how_to_wait(job) + "\n"
             "기다리지 않으면 결과는 사용자의 다음 메시지 뒤에 온다.")
 
@@ -95,8 +95,8 @@ def deliver(job):
         pathlib.Path(job).unlink()
     except OSError:                                          # 이미 지웠거나(다른 쪽이 전함) 다른 프로세스가 여는 중
         return None
-    return j.get("message") or (f"[workflowy] snapshot: 노드 {j.get('id')} 를 읽던 백그라운드 프로세스가 결과 없이 멈췄다 "
-                                "(중단됨). 파일은 만들지 않았다. /workflowy:snapshot 으로 다시 부른다.")
+    return j.get("message") or (f"[workflowy] look-tree: 노드 {j.get('id')} 를 읽던 백그라운드 프로세스가 결과 없이 멈췄다 "
+                                "(중단됨). 파일은 만들지 않았다. /workflowy:look-tree 로 다시 부른다.")
 
 # ----------------------------------------------------------------- 백그라운드 읽기
 
@@ -119,10 +119,10 @@ def run(job):
         os.replace(tmp, out)
         j.update(status="done", message=summary(out, top, lines, count, t, time.time() - t0))
     except urllib.error.HTTPError as e:
-        j.update(status="failed", message=f"[workflowy] snapshot 실패: 노드 {s} — {REASON.get(e.code, e.reason or '')} "
+        j.update(status="failed", message=f"[workflowy] look-tree 실패: 노드 {s} — {REASON.get(e.code, e.reason or '')} "
                                           f"(HTTP {e.code}). 파일은 만들지 않았다.")
     except Exception as e:
-        j.update(status="failed", message=f"[workflowy] snapshot 실패: 노드 {s} — {type(e).__name__}: {e}. 파일은 만들지 않았다.")
+        j.update(status="failed", message=f"[workflowy] look-tree 실패: 노드 {s} — {type(e).__name__}: {e}. 파일은 만들지 않았다.")
     j["ended"] = time.time()
     put(job, j)
 
@@ -167,7 +167,7 @@ def summary(out, top, lines, count, t, sec):
     title = " ".join(text(top.get("name")).split())
     title = title[:60] + ("…" if len(title) > 60 else "")
     calls = len(t["times"]) + t["errors"] + 2                # + 노드 자체(get) 와 그 자식(root 의 children)
-    say = [f"[workflowy] snapshot 끝남: {out}",
+    say = [f"[workflowy] look-tree 끝남: {out}",
            f"'{title}' {wfapi.url(top['id'])} — 노드 {count}개(이 노드 포함), {len(lines)}줄, "
            f"{out.stat().st_size / 1024:.0f}KB",
            f"읽기 {sec:.0f}초: 호출 {calls}번" + (f", 한도(429) 대기 {t['waits']}번" if t["waits"] else "")]
@@ -190,12 +190,12 @@ def wait(job):
     while True:
         j = load(job)
         if not j:
-            print("[workflowy] snapshot: 결과를 이미 전했다 (또는 없는 작업이다).")
+            print("[workflowy] look-tree: 결과를 이미 전했다 (또는 없는 작업이다).")
             return
         if job_state(j) != "running":
             break
         time.sleep(1)
-    print(deliver(job) or "[workflowy] snapshot: 결과를 이미 전했다.")
+    print(deliver(job) or "[workflowy] look-tree: 결과를 이미 전했다.")
 
 # ----------------------------------------------------------------- 진입점
 
@@ -214,7 +214,7 @@ def main():
         hook(ev)
     except Exception as e:
         if CMD.match((ev.get("prompt") or "").strip()):        # 다른 프롬프트에는 아무것도 붙이지 않는다
-            print(f"[workflowy] snapshot 실패: {type(e).__name__}: {e}")
+            print(f"[workflowy] look-tree 실패: {type(e).__name__}: {e}")
     sys.exit(0)   # 훅은 무슨 일이 있어도 0. exit 2는 프롬프트를 막는다.
 
 

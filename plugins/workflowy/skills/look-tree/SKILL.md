@@ -1,13 +1,15 @@
 ---
-name: snapshot
+name: look-tree
 description: Workflowy 노드 하나와 그 하위 전체를 Workflowy 서버에서 백그라운드로 읽어 scratchpad 에 텍스트 파일로 저장하고, 파일 경로와 노드 수만 알린다 (트리 내용은 context 에 넣지 않는다). Workflowy 노드의 최신 내용을 통째로 살펴보거나 찾아보게 하려 할 때 쓴다 — 그 내용을 요약·분석·검색하게 할 때. 읽기만 한다: Workflowy 에 쓰거나 고치지 않는다.
 argument-hint: <노드 id 또는 URL> [요청]
 disable-model-invocation: true
 ---
 
-# Workflowy 노드 스냅숏
+# Workflowy 노드 보기
 
-인자는 훅이 먼저 처리한다: 백그라운드에서 읽기를 시작하고 `[workflowy] snapshot 시작` 으로 알린다. 읽기 명령을 따로 실행하지 않는다.
+인자는 훅이 먼저 처리한다: 백그라운드에서 읽기를 시작하고 `[workflowy] look-tree 시작` 으로 알린다. 읽기 명령을 따로 실행하지 않는다.
+`[workflowy] look-tree` 알림이 없으면 읽기가 시작되지 않은 것이니,
+사용자에게 `/workflowy:look-tree <id>` 로 다시 부르라고 전하고 멈춘다.
 시작하지 못했으면(id 가 없거나 형식이 틀림 등) 그 이유를 사용자에게 전하고 멈춘다.
 
 1. 훅이 알려 준 wait 명령을 Bash 의 run_in_background 로 실행하고, 사용자에게 읽는 중이라고 한 줄로 알린다.
