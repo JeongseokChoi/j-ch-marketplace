@@ -7,6 +7,7 @@ Claude Code 플러그인 모음.
 Workflowy 노드 하나를 작업 흐름(workstream)의 기록으로 삼아, Claude Code 세션들이 그 아래에 작업 과정을
 이어서 정리해 기록한다.
 작업을 **지금 지켜보고**, **남겨 두고**, **나중에 파악**하기 위한 기록이다.
+노드 하나와 그 하위 전체를 파일로 받아 Claude 에게 읽히는 `/workflowy:snapshot` 도 있다 (아래 **노드 스냅숏**).
 
 ### 설치
 
@@ -169,6 +170,40 @@ Claude 는 todo 를 `close` 도구로 닫으면서 어떻게 닫는지 고른다
     └── ⏸ 보류: 원본이 암호화됨 — 설치 후 재진행
 ```
 
+### 노드 스냅숏
+
+```
+/workflowy:snapshot daa0961ddeee                          # 이 노드와 그 하위 전체를 파일로 받는다
+/workflowy:snapshot daa0961ddeee 요약해줘                  # id 뒤의 글은 요청으로 전달된다
+```
+
+- 노드 하나와 그 하위 전체(자식·손자 …)를 Workflowy 서버에서 읽어 이 세션의 scratchpad 에 `workflowy-<short id>.md` 로
+  저장한다. context 에는 파일 경로와 요약(노드 수·줄 수·크기)만 남고, Claude 는 필요한 부분만 Grep·Read 로 읽는다.
+  같은 노드를 다시 받으면 덮어쓴다. scratchpad 가 없는 세션은 OS 임시 폴더의 `workflowy-snapshot/<session id>/` 에 둔다.
+- **읽기만 한다.** Workflowy 에 쓰지 않고 workstream 의 cache·state 도 바꾸지 않는다 (기록에 쓸 트리를 새로 받는 것은 `sync`).
+  기록 중이 아니어도 되고 어떤 노드든 된다. 읽는 것은 그 노드와 하위뿐이다.
+- **사용자만 부른다.** Claude 는 이 스킬을 부를 수 없다 (`disable-model-invocation`). 읽기는 사용자가 친 명령을 받은 훅만
+  시작하고, Claude 의 Bash 에는 API key 가 없다.
+- **백그라운드에서 읽는다.** 훅은 프로세스를 띄우고 곧바로 끝난다 (훅 timeout 과 무관). 읽기는 `sync` 와 같다: 병렬 8개, 끝까지,
+  요청 한도(429)에는 모두 멈춰 기다린다. Claude 는 훅이 알려 준 `wait` 명령을 Bash 백그라운드로 실행해 두고, 끝나면 결과를 받아
+  요청을 이어서 한다. `wait` 를 부르지 않았으면 결과는 사용자의 다음 메시지 뒤에 한 번 전해진다. 끝나기 전에는 파일이 없다.
+- 파일은 **Workflowy 가 준 값만** 담는다. 읽는 트리에 무엇이 있을지 모르므로 workstream 의 규칙(▹ 도구 실행 빼기, 요청·닫은
+  방식 알아보기 등)은 적용하지 않는다. ▹ 노드도 보통 노드로 담고 그 하위도 읽는다 (그래서 기록 root 는 `sync` 보다 호출이 많다).
+  비밀값도 가리지 않는다.
+
+  ```
+  # https://workflowy.com/#/daa0961ddeee · 2026-09-24 12:00 에 Workflowy 에서 읽음 · 노드 42개
+  - 인증 개편  (id: daa0961ddeee)
+    - [bullets] 인증 미들웨어 3단계 분리  (id: 1a2b3c4d5e6f)
+      │ 2026-09-23 14:05
+      - ✓ [todo] Phase 1 · 구조 파악  (id: 6f5e4d3c2b1a)
+  ```
+  한 줄에 노드 하나다. `✓` 는 완료, `[ ]` 는 layoutMode 원문(없으면 생략), 들여쓰기가 깊이, `┆` 는 여러 줄 제목(코드 블록 등)의
+  나머지, `│` 는 note. 제목·note 는 HTML 을 평문으로만 바꾼다 (서식은 빠지고 링크는 `글자 (주소)`).
+  하위를 다 읽지 못한 노드에는 `[하위 못 읽음]` 이 붙고 결과에 이유가 나온다.
+- 진행 상태는 `${CLAUDE_PLUGIN_DATA}/snapshot/<session id>-<short id>.json` 에 있고, 결과를 전하면 지운다.
+  같은 노드를 읽는 중이면 새로 띄우지 않고 알린다. 프로세스가 결과 없이 사라지면 "중단됨" 으로 알린다.
+
 ### 동작 방식
 
 | 구성 | 역할 |
@@ -180,6 +215,8 @@ Claude 는 todo 를 `close` 도구로 닫으면서 어떻게 닫는지 고른다
 | UserPromptSubmit 훅 `prompt` | `/workflowy:workstream` 인자 처리와 이어받기(시작 때 요청 목록 읽기, `sync` 때 백그라운드 프로세스 띄우기, `clear-cache` 때 cache 비우기). 기록 중이면 요청마다 기록 지침을 한 줄로 상기하고, 끝난 `sync` 결과를 전함 |
 | 백그라운드 `wf.py sync-run` | `sync` 가 띄우는 분리된 프로세스. root 아래 전체를 끝까지 읽어 cache 를 통째로 바꾸고, 잠금을 잠깐 잡아 state 에 합친 뒤 결과를 남김 |
 | SessionStart 훅 | 대화 압축·재개 뒤 기록 중인 root 와 지금까지 만든 노드(id 포함)를 Claude 에게 다시 알림 |
+| UserPromptSubmit 훅 `snapshot.py` | `/workflowy:snapshot <id>` 면 백그라운드 읽기를 띄운다. 끝났는데 전하지 않은 스냅숏 결과가 있으면 전함. workstream 과 따로 돈다 |
+| 백그라운드 `snapshot.py run` / `wait` | `run` 은 노드와 하위 전체를 끝까지 읽어 파일로 저장하고 결과를 남김. `wait` 는 Claude 가 Bash 로 그 끝을 기다려 결과를 받음 (Workflowy 를 부르지 않음) |
 
 - state 는 `stop` 하거나 다른 노드로 바꾸면 `<session id>.<시각>.json` 으로 남겨 둔다. 다른 세션이 이어받을 때
   그 세션이 cache 를 받은 뒤에 만든 노드와 닫은 todo 를 여기서 읽는다.
@@ -218,6 +255,7 @@ prompt 훅 timeout 은 30초가 되었다.
 `clear-cache` 가 생겼다. 올라온 뒤 root 마다 첫 `sync`(또는 `clear-cache`) 전까지는 전처럼 state 들을 모두 합쳐 이어받는다.
 3.6 부터 cache 가 본문(제목 전체·note, 코드 원문)을 담고, Claude 가 `read` 도구로 읽는다. `sync` 는 단락·인용·코드와
 이유 노드의 하위도 읽는다 (호출이 그만큼 는다). 올라온 뒤 root 마다 첫 `sync` 전까지 cache 의 노드에는 본문이 없다.
+3.7 부터 `/workflowy:snapshot` 이 생겼다 (위 **노드 스냅숏**). workstream 의 동작은 그대로다.
 
 ### 1.x 에서 옮겨 오기
 

@@ -7,7 +7,9 @@
     ],
     "UserPromptSubmit": [
       { "hooks": [{ "type": "command", "timeout": 30,
-                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" prompt" }] }
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/wf.py\" prompt" }] },
+      { "hooks": [{ "type": "command", "timeout": 10,
+                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/snapshot.py\"" }] }
     ],
     "PreToolUse": [
       { "matcher": "mcp__plugin_workflowy_workflowy__.*",

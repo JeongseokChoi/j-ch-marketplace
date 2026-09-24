@@ -237,7 +237,7 @@ def tool_run(n):
     return unhtml(n.get("name")).lstrip().startswith(TOOL)
 
 
-def subtree(root, limit=20.0, workers=8, progress=None):
+def subtree(root, limit=20.0, workers=8, progress=None, skip=leaf):
     """root 아래 트리를 읽는다. root 의 자식(요청 목록)을 먼저 읽고, 최신 요청부터 그 하위를 병렬로 읽는다.
     limit 초(시간 한도)가 지나면 멈추고 읽은 만큼 돌려준다. 훅 timeout 에 걸려 통째로 잃지 않기 위해서다.
     limit 이 None 이면 끝까지 읽는다 (백그라운드 sync). 이때만 요청 한도(429)에 오래 기다린다: 모든 작업자가 함께
@@ -245,6 +245,8 @@ def subtree(root, limit=20.0, workers=8, progress=None):
     progress(노드 수, 호출 수, 한도 대기 횟수) 는 2초에 한 번쯤 불린다.
     그 노드 수는 ▹ 도구 실행을 뺀 수다 — 이어받는 트리(from_api)가 ▹ 를 넣지 않으므로, sync 가 끝난 뒤 알리는 수와 맞춘다.
     root 의 자식을 읽지 못하면 예외를 그대로 올린다 (호출한 쪽이 cache 로 대신한다).
+    skip(노드) 가 참인 노드는 자식을 읽지 않는다 (기본 leaf: ▹ 도구 실행). None 이면 모든 노드의 자식을 읽는다.
+    같은 id 의 자식은 한 번만 읽는다 — 미러가 어떤 id 로 오는지 몰라, 순환이 생겨도 끝나게 한다.
     돌려주는 값: nodes(API 노드. 트리 순서가 아니다), missing(자식을 읽지 못한 노드 id), times(성공한 호출별 초),
     errors(실패한 호출 수), reasons(실패 이유별 횟수), waits(한도로 멈춘 횟수), seconds(전체 초).
     스레드는 daemon 으로 직접 띄운다. ThreadPoolExecutor 는 프로세스가 끝날 때 한도를 넘긴 호출까지 기다린다."""
@@ -261,8 +263,12 @@ def subtree(root, limit=20.0, workers=8, progress=None):
     kept = sum(1 for n in top if not tool_run(n))     # progress 에 알리는 노드 수 (▹ 제외)
     todo, done, stop = queue.PriorityQueue(), queue.Queue(), threading.Event()
     waiting = set()                              # 넣었지만 아직 결과를 받지 못한 노드
+    seen = {root}                                # 한 번이라도 넣은 노드
 
     def put(rank, depth, n):
+        if n["id"] in seen or (skip and skip(n)):
+            return
+        seen.add(n["id"])
         waiting.add(n["id"])
         todo.put((rank, depth, n["id"]))
 
@@ -279,8 +285,7 @@ def subtree(root, limit=20.0, workers=8, progress=None):
             done.put((rank, depth, nid, got, time.time() - s))
 
     for rank, n in enumerate(reversed(top)):     # rank 0 이 최신 요청. 같은 rank 의 하위가 먼저 읽힌다
-        if not leaf(n):
-            put(rank, 0, n)
+        put(rank, 0, n)
     for _ in range(workers if waiting else 0):
         threading.Thread(target=work, daemon=True).start()
     shown = last = time.time()
@@ -317,8 +322,7 @@ def subtree(root, limit=20.0, workers=8, progress=None):
             nodes += got
             kept += sum(1 for c in got if not tool_run(c))
             for c in got:
-                if not leaf(c):
-                    put(rank, depth + 1, c)
+                put(rank, depth + 1, c)
         report()                                 # 방금 받은 자식까지 센 뒤에 알린다
     stop.set()
     return {"nodes": nodes, "missing": failed + sorted(waiting), "times": times, "errors": len(failed),
