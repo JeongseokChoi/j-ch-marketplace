@@ -41,10 +41,8 @@ SHORT = re.compile(r"(?:#/)?([0-9a-f]{12})/?$")   # URL 끝, short id, 전체 UU
 
 TOOL = "▹ "                                        # 훅이 도구 실행마다 붙이는 노드의 머리말
 
-# 트리를 읽을 때 자식을 읽지 않는 노드: 훅이 붙인 ▹ 도구 실행, close 가 쓴 이유 노드, 단락·인용·코드.
-# 우리가 그 아래에 쓰지 않으므로 호출을 아낀다.
-LEAF_NAME  = re.compile(r"\s*(?:" + re.escape(TOOL) + "|(?:" + "|".join(map(re.escape, OUTCOMES.values())) + r"): )")
-LEAF_TYPES = ("p", "quote-block", "code-block")
+# 코드 블록 name 의 ``` 울타리 (payload 가 여러 줄 코드를 감싸 보낸다)
+FENCE = re.compile(r"^```[^\n]*\n?|\n?```\s*$")
 
 RETRIED, _lock = {}, threading.Lock()              # 재시도한 HTTP 상태 코드별 횟수 (doctor 가 병렬 읽기를 볼 때 쓴다)
 
@@ -229,8 +227,9 @@ def why(e):
 
 
 def leaf(n):
-    """트리를 읽을 때 자식을 읽지 않는 노드인가 (LEAF_NAME, LEAF_TYPES)."""
-    return (n.get("data") or {}).get("layoutMode") in LEAF_TYPES or bool(LEAF_NAME.match(n.get("name") or ""))
+    """트리를 읽을 때 자식을 읽지 않는 노드인가: 훅이 붙인 ▹ 도구 실행뿐이다. 그 아래에는 아무도 쓰지 않는다.
+    단락·인용·코드와 close 가 쓴 이유 노드는 사용자가 Workflowy 에서 그 아래에 적을 수 있어 읽는다."""
+    return tool_run(n)
 
 
 def tool_run(n):
@@ -338,8 +337,13 @@ def request_note(note):
 
 
 def create(parent, name, type="bullets", note=None, request=False):
-    """노드를 맨 아래에 만들고 전체 UUID 를 돌려준다. 순서가 곧 만든 순서가 되도록 position 은 받지 않는다.
-    name 은 평문으로 보낸다 (plain). request 면 요청 노드로 만든다: 제목은 굵게, note 첫 줄에 날짜·시각."""
+    """노드를 맨 아래에 만들고 전체 UUID 를 돌려준다. 순서가 곧 만든 순서가 되도록 position 은 받지 않는다."""
+    return call("POST", "/nodes", payload(parent, name, type, note, request))["item_id"]
+
+
+def payload(parent, name, type="bullets", note=None, request=False):
+    """create 가 보내는 본문. name 은 평문으로 보낸다 (plain). request 면 요청 노드로 만든다: 제목은 굵게,
+    note 첫 줄에 날짜·시각. 훅(wf.py track)도 이것으로 Workflowy 에 실제로 들어간 글을 알아낸다 (body)."""
     if type not in TYPES:
         raise ValueError(f"지원하지 않는 type: {type} (가능: {', '.join(TYPES)})")
     name = str(name or "").replace("\r\n", "\n").strip("\n")
@@ -363,7 +367,15 @@ def create(parent, name, type="bullets", note=None, request=False):
         b["layoutMode"] = type
     if note:
         b["note"] = safe(scrub(note, 8000, lines=True))
-    return call("POST", "/nodes", b)["item_id"]
+    return b
+
+
+def body(name, note, code=False):
+    """노드의 본문을 평문으로: (제목 전체, note). API 가 돌려준 HTML 이든 payload 가 보낸 글이든 같은 글이 되게 한다.
+    code 면 제목 자리에 코드 원문(``` 울타리를 벗긴 것)을, 여러 줄 그대로 둔다."""
+    t = unhtml(name)
+    t = FENCE.sub("", t).strip("\n") if code else t.strip()
+    return t, unhtml(note).strip("\n")
 
 
 def complete(nid):

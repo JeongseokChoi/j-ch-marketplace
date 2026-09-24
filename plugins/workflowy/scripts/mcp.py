@@ -2,18 +2,27 @@
 """
 mcp.py - Claude 가 Workflowy 작업 로그를 직접 쓰는 MCP 서버 (stdio, 표준 라이브러리만).
 
-도구는 만들기(create)와 todo 닫기(close) 둘뿐이다. 이미 쓴 노드를 고치거나 지우는 도구는 두지 않는다.
-어느 노드 아래에 쓸 수 있는지는 state 를 아는 훅(wf.py guard)이 도구 호출 전에 검사한다.
-서버는 세션을 모르므로 상태를 갖지 않는다.
+도구는 만들기(create), todo 닫기(close), 본문 읽기(read) 셋이다. 이미 쓴 노드를 고치거나 지우는 도구는 두지 않는다.
+어느 노드 아래에 쓰고 어느 노드를 읽을 수 있는지는 state 를 아는 훅(wf.py guard)이 도구 호출 전에 검사한다.
+서버는 세션을 모르므로 상태를 갖지 않는다. read 는 데이터 폴더의 cache·state 를 읽기만 한다 (wf.bodies).
 """
-import json, sys, urllib.error
-import wfapi
+import json, os, pathlib, sys, urllib.error
+import wfapi, wf
 
-VERSION = "3.4.0"
+VERSION = "3.6.0"
+
+# 데이터 폴더: plugin.json 이 env 로 넘기는 WORKFLOWY_DATA, 없으면 Claude Code 가 넘기는 CLAUDE_PLUGIN_DATA.
+# 치환되지 않은 ${...} 는 없는 것으로 본다. 없으면 read 가 그렇다고 알린다.
+for _k in ("WORKFLOWY_DATA", "CLAUDE_PLUGIN_DATA"):
+    _v = os.environ.get(_k)
+    if _v and not _v.startswith("${"):
+        wf.DATA_DIR = pathlib.Path(_v)
+        break
 
 INSTRUCTIONS = (
     "사용자가 /workflowy:workstream <id> 로 기록을 시작한 세션에서만 쓴다. "
-    "지정된 root 노드 자체는 건드리지 않고 그 아래에 노드를 추가만 한다.")
+    "지정된 root 노드 자체는 건드리지 않고 그 아래에 노드를 추가만 한다. "
+    "이전 기록의 본문은 read 로 root 아래에서만 읽는다.")
 
 TOOLS = [
     {"name": "create",
@@ -61,6 +70,21 @@ TOOLS = [
              "outcome": {"type": "string", "enum": list(wfapi.OUTCOMES), "default": "done"},
              "reason": {"type": "string", "description": "한 줄 결과(done) 또는 이유(cancel·replace·hold)"}},
          "required": ["ids"]}},
+    {"name": "read",
+     "description": (
+         "이어받았거나 이 세션에서 만든 노드의 본문(제목 전체·note, code 는 코드 원문)을 하위 트리와 함께 돌려준다. "
+         "이어받기 안내에는 제목(60자까지)만 보이므로, 이전 요청의 내용이 필요할 때 그 요청의 id 로 부른다. 필요한 노드만 읽는다. "
+         "Workflowy 를 부르지 않고 이 PC 의 cache(마지막 sync 로 받은 트리)에 그 뒤 이 PC 의 세션들이 쓴 것을 더해 읽는다 — "
+         "그 뒤 다른 PC 에서 쓰거나 Workflowy 에서 고친 내용은 없다. ▹ 도구 실행은 담지 않는다. "
+         "root id 를 주면 root 아래 전체. 결과가 3만 자를 넘으면 거기서 멈추고 이어 읽을 노드의 id 를 알려 준다."),
+     "inputSchema": {
+         "type": "object",
+         "properties": {
+             "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                     "description": "읽을 노드의 id 들 (기록 시작 때 받은 id, create 가 돌려준 id, root id)"},
+             "depth": {"type": "integer", "minimum": 0,
+                       "description": "하위를 몇 단계까지 보일지. 주지 않으면 끝까지, 0 은 그 노드만"}},
+         "required": ["ids"]}},
 ]
 
 
@@ -71,6 +95,11 @@ def run(name, args):
         return f"id: {nid}\nurl: {wfapi.url(nid)}"
     if name == "close":
         return close(wfapi.ids_of(args.get("ids")), args.get("outcome") or "done", str(args.get("reason") or "").strip())
+    if name == "read":
+        ids, depth = wfapi.ids_of(args.get("ids")), args.get("depth")
+        if not ids:
+            raise ValueError("ids 가 비어 있음")
+        return wf.bodies(ids, depth if isinstance(depth, int) and not isinstance(depth, bool) and depth >= 0 else None)
     raise ValueError(f"알 수 없는 도구: {name}")
 
 

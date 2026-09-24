@@ -38,12 +38,15 @@ claude plugin install workflowy@j-ch-marketplace --config api_key=<WORKFLOWY_API
 지정한 노드 아래에 이미 있는 기록은 **이어받는다**. Claude 는 지금까지의 트리
 (길면 요청 목록, 열린 todo, 보류된 todo, 마지막 요청. 요청 옆에 날짜)를 받아 흐름을 파악하고,
 이전 요청 아래에 덧붙이거나 남은 todo 를 이어서 할 수 있다.
+트리에는 제목(60자까지)만 보이고, 요청의 내용(제목 전체·note·코드 원문)이 필요하면 Claude 가 `read` 도구로 그 요청만 읽는다
+(아래 **cache 와 state**).
 
 - **시작할 때**는 요청 목록만 Workflowy 에서 읽고(API 1번), 요청의 하위는 이 PC 의 cache 를 쓴다 (아래 **cache 와 state**).
   안내에 cache 를 언제 받았는지(마지막 `sync`, 비운 시각)가 붙는다.
 - **`sync`** 는 root 아래 전체를 Workflowy 에서 읽어 **cache 를 통째로 바꾼다**. 다른 PC 에서 쓴 기록과 Workflowy 에서 직접 적거나
   체크하거나 지운 내용이 반영되고, 이 세션이 이어받은 부분도 바뀐다. 세션 중 언제든 부를 수 있고, 이 세션이 만든 노드는 그대로 둔다.
   Workflowy 에 없는 값(todo 의 `steps`)과 못 읽은 하위는 옛 cache 에서 이어 온다.
+  단락·인용·코드 노드와 `close` 가 쓴 이유 노드의 하위도 읽는다. ▹ 도구 실행 노드는 읽지도 담지도 않는다.
   노드마다 API 를 한 번씩 부르므로 시간이 걸린다 (병렬 8개. 노드 350개쯤이면 20초 남짓).
   그래서 **백그라운드에서 읽는다**: 훅은 프로세스를 띄우고 곧바로 끝나고(훅 timeout 과 무관, 시간 제한 없음),
   다 읽으면 결과가 사용자의 다음 메시지나 Claude 의 다음 workflowy 도구 결과 뒤에 한 번 전해진다.
@@ -71,7 +74,7 @@ claude plugin install workflowy@j-ch-marketplace --config api_key=<WORKFLOWY_API
 |---|---|---|
 | 무엇 | root 하나의 트리를 이 PC 가 아는 사본 | 세션 하나의 기록 상태 |
 | 파일 | `${CLAUDE_PLUGIN_DATA}/cache/<root>.json` | `${CLAUDE_PLUGIN_DATA}/state/<session id>.json` |
-| 담는 것 | `sync` 로 받은 트리(제목 앞 60자·타입·닫힘·보류·`steps`)와 받은 시각 | 기록 중인 root, 이 세션의 노드(이어받은 것과 만든 것), 지금 작업 중인 노드 |
+| 담는 것 | `sync` 로 받은 트리(본문·제목 앞 60자 이름표·타입·닫힘·보류·`steps`)와 받은 시각 | 기록 중인 root, 이 세션의 노드(만든 것은 본문까지, 이어받은 것은 본문 없이), 지금 작업 중인 노드 |
 | 누가 쓰나 | `sync`(통째로 바꿈), `clear-cache`(비움) | 그 세션의 훅 (`track` 이 만든 노드와 닫은 todo 를 기록) |
 | 지우면 | Workflowy 에서 다시 받으면 된다 (원본은 Workflowy) | 기록이 끊긴다 (쓸 수 있는 parent 를 모른다) |
 
@@ -84,7 +87,13 @@ Workflowy ──sync──▶ cache ──시작──▶ state 의 이어받은
   그래서 `sync` 를 기다리지 않아도 이 PC 에서 이어진 작업이 보인다. state 의 이어받은 노드는 다른 세션이 읽지 않는다 —
   cache 보다 낡은 사본이기 때문이다.
 - create·close 는 Workflowy 를 곧바로 부르므로 세션이 쓴 것은 이미 Workflowy 에 있다. 그래서 다음 `sync` 의 cache 에 저절로 들어간다.
-- cache 는 note 를 담지 않는다. 흐름(무엇을 했고 무엇이 남았나)을 잡는 지도이고, 내용은 Workflowy 에 있다.
+- 노드의 **본문**(제목 전체·note, 코드 블록은 원문)은 cache 와, 세션이 만든 노드의 state 에만 둔다.
+  이어받은 노드를 state 로 옮길 때는 본문을 뺀다 — state 는 세션마다 쌓이고 훅이 도구마다 읽고 쓰기 때문이다.
+  세션이 만든 노드의 본문은 `create` 가 실제로 보낸 글(비밀값 가림·비슷한 글자 바꿈 뒤)이라 다음 `sync` 로 받는 글과 같다.
+- 이어받기 안내에는 60자 이름표만 나오고, Claude 는 필요한 노드의 본문을 `read` 도구로 읽는다. `read` 는 Workflowy 를 부르지 않고
+  cache 에, 받은 뒤 이 PC 의 세션들이 쓴 것을 더해 읽는다. 읽을 수 있는 범위는 `create` 의 parent 와 같다 (root 와 이어받았거나
+  이 세션이 만든 노드). 3만 자를 넘으면 멈추고 이어 읽을 노드의 id 를 알려 준다. 3.6 전에 받은 cache 의 노드는 본문이 없어
+  `[본문 없음]` 으로 보인다 (`sync` 하면 채워진다).
 
 ### 기록되는 구조
 
@@ -164,8 +173,8 @@ Claude 는 todo 를 `close` 도구로 닫으면서 어떻게 닫는지 고른다
 
 | 구성 | 역할 |
 |---|---|
-| MCP 서버 `workflowy` (`scripts/mcp.py`) | Claude 가 쓰는 도구 `create`(노드 추가. `request: true` 면 요청 노드), `close`(todo 닫기: 완료·취소·방향 전환·보류). 수정·삭제 도구는 없다 |
-| PreToolUse 훅 `guard` | 기록 중인 세션의 메인 Claude 가, root 또는 이 세션에서 만들었거나 이어받은 노드 아래에만 쓰도록 검사. root 바로 아래는 요청만. todo 를 닫을 때 결과·이유·하위 todo 도 검사. 범위 안이면 권한 확인 없이 허용 |
+| MCP 서버 `workflowy` (`scripts/mcp.py`) | Claude 가 쓰는 도구 `create`(노드 추가. `request: true` 면 요청 노드), `close`(todo 닫기: 완료·취소·방향 전환·보류), `read`(본문 읽기. 데이터 폴더의 cache·state 를 읽기만 한다). 수정·삭제 도구는 없다 |
+| PreToolUse 훅 `guard` | 기록 중인 세션의 메인 Claude 가, root 또는 이 세션에서 만들었거나 이어받은 노드 아래에만 쓰도록 검사. root 바로 아래는 요청만. todo 를 닫을 때 결과·이유·하위 todo 도 검사. `read` 도 같은 범위만. 범위 안이면 권한 확인 없이 허용 |
 | PostToolUse 훅 `track` | 만든 노드와 닫은 todo(보류 포함, 닫은 시각)를 state 에 기록. 끝난 `sync` 결과가 있으면 도구 결과 뒤에 덧붙여 전함 |
 | PreToolUse 훅 `step` | 도구 실행을 지금 작업 중인 노드 아래에 `▹` 로 추가 |
 | UserPromptSubmit 훅 `prompt` | `/workflowy:workstream` 인자 처리와 이어받기(시작 때 요청 목록 읽기, `sync` 때 백그라운드 프로세스 띄우기, `clear-cache` 때 cache 비우기). 기록 중이면 요청마다 기록 지침을 한 줄로 상기하고, 끝난 `sync` 결과를 전함 |
@@ -207,6 +216,8 @@ prompt 훅 timeout 은 30초가 되었다.
 3.5 부터 이 PC 에 root 마다 cache 를 두고, `sync` 가 그것을 통째로 바꾼다 (전에는 세션 state 들의 합집합이 cache 노릇을 해서
 `sync` 뒤에도 끝난 세션의 낡은 사본 — Workflowy 에서 지운 노드, 체크를 푼 todo — 가 다음 시작에 되살아났다).
 `clear-cache` 가 생겼다. 올라온 뒤 root 마다 첫 `sync`(또는 `clear-cache`) 전까지는 전처럼 state 들을 모두 합쳐 이어받는다.
+3.6 부터 cache 가 본문(제목 전체·note, 코드 원문)을 담고, Claude 가 `read` 도구로 읽는다. `sync` 는 단락·인용·코드와
+이유 노드의 하위도 읽는다 (호출이 그만큼 는다). 올라온 뒤 root 마다 첫 `sync` 전까지 cache 의 노드에는 본문이 없다.
 
 ### 1.x 에서 옮겨 오기
 
