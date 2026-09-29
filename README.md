@@ -290,3 +290,142 @@ push 해야 사용자에게 갱신이 전달된다.
 ```bash
 claude plugin uninstall workflowy
 ```
+
+## delegate — 위임 세션
+
+설치하면 이 PC 의 모든 Claude Code 메인 세션이 `delegate:session` 역할로 돈다. 세션은 **판단만** 한다:
+요청 정리, 계획, worker 배치, 감시, 검증 지휘, 보고, 그리고 `/workflowy:workstream` 을 켰을 때의 Workflowy 기록.
+파일 읽기·조사·편집·명령 실행처럼 손이 가는 일은 전부 worker 서브에이전트가 하고, 그 결과는 서로 독립인 verifier 3개 이상이
+각각 다른 관점에서 PASS 해야 완료(`DONE[T<n>]`)가 된다. 세션이 직접 손을 대려 하면 훅이 막는다.
+
+### 설치
+
+```bash
+claude plugin marketplace add JeongseokChoi/j-ch-marketplace
+claude plugin install delegate@j-ch-marketplace
+```
+
+- Python 3 이 `python3` 으로 실행되어야 한다 (훅과 watchdog 은 표준 라이브러리만 쓴다).
+- 새로 시작하는 세션부터 적용된다. 열린 세션은 `/reload-plugins`.
+- 새 PC 는 이 순서로 꾸린다.
+  1. Claude Code 설치, 로그인.
+  2. `claude plugin marketplace add JeongseokChoi/j-ch-marketplace`
+  3. Workflowy 기록을 쓰면 `claude plugin install workflowy@j-ch-marketplace --config api_key=<WORKFLOWY_API_KEY>` (위 **workflowy**).
+  4. `claude plugin install delegate@j-ch-marketplace`
+  5. j-ch-marketplace 의 자동 업데이트 켜기. 공식 marketplace 가 아니라 기본이 꺼져 있다. 세션에서 `/plugin` → **Marketplaces** 탭 →
+     `j-ch-marketplace` → **Enable auto-update**. 그러면 `~/.claude/settings.json` 의 항목이 이렇게 된다 (직접 적어도 된다).
+
+     ```json
+     "extraKnownMarketplaces": {
+       "j-ch-marketplace": {
+         "source": { "source": "github", "repo": "JeongseokChoi/j-ch-marketplace" },
+         "autoUpdate": true
+       }
+     }
+     ```
+
+     켜 두면 세션의 첫 메시지 뒤 10분 안에 marketplace 를 새로 받아 설치본을 갱신하고, 새 버전은 다음 세션부터 뜬다
+     (`Plugin updated` 알림이 오면 `/reload-plugins`). `DISABLE_AUTOUPDATER=1` 같은 환경 변수가 있으면 돌지 않는다.
+
+### 세션의 동작
+
+메시지 하나는 이렇게 처리된다. 인사·감사만 있는 메시지는 바로 답한다.
+
+1. **정리** — 메시지를 요구 사항으로 나누고, 각각 새 작업(T1, T2, … 세션 전체에서 번호를 이어 붙인다)인지 진행 중인 작업의
+   연속(같은 산출물·파일, worker 의 질문에 대한 답)인지 정한다. 애매하면 묻고 짐작하지 않는다. 정보가 모자라면 조사 worker 를 먼저 보낸다.
+   조사 worker 는 그 작업의 T 번호로 돌고, 검증은 작업의 최종 결과에 한 번 한다.
+2. **배치** — 일의 종류로 모델과 역할을 고른다. 사용자가 모델을 지정하면 그것이 우선이다.
+
+   | 일 | 모델 | 역할 |
+   |---|---|---|
+   | 찾기, 파일 위치 확인, 기계적 변환 | haiku | worker-low |
+   | 보통의 구현·편집·문서·조사 | sonnet | worker-medium |
+   | 설계, 원인 모르는 버그, 여러 파일에 걸친 변경 | opus | worker-xhigh |
+   | 깊은 추론, 아래 단계에서 실패한 일 | fable | worker-xhigh |
+
+   worker 는 브리프(목표, 완료 기준, 범위, 세부를 둘 파일 — 세션의 details 폴더의 `T<n>-details.md`, 보고 형식)를 받아 일하고,
+   정해진 형식의 보고(`STATUS / TASK / SUMMARY / ARTIFACTS / VERIFIED / OPEN`)를 `SubagentHandback` 으로 낸다. 형식이 틀리면 훅이 돌려보낸다.
+   description 은 `T<n> <한 일> · <모델>/<effort>` (haiku 는 effort 없이 `· haiku`) 로 붙어 어떤 에이전트가 무엇을 하는지 보인다.
+3. **감시** — worker·verifier 가 도는 동안 watchdog 을 `Monitor` 로 하나만 걸어 둔다 (둘을 함께 본다). 한 번 걸면 10–30분 뒤에 끝나므로, 끝났다는 알림이 오면
+   다시 건다. 10분쯤 움직임이 없으면 `STALL` → 상태 확인 메시지,
+   5분 더 없으면 `STALL2` → `TaskStop` 뒤 재시도. 보고 없이 끝난 worker(턴 한도, 중단)도 실패로 보고 재시도한다.
+   재시도는 작업당 2번: 먼저 같은 worker 를 `SendMessage` 로 이어서, 다음은 한 단계 위 모델의 새 worker 에게 지금까지의 진행을 넘긴다.
+   그래도 안 되면 근거와 함께 사용자에게 알리고 `PushNotification` 을 보낸다.
+4. **검증** — worker 가 `done` 이라고 하면 verifier 를 3개 이상 병렬로 띄운다 (아래 **검증 규칙과 비용**).
+5. **보고** — 사용자 언어로 짧게: 한 일, 검증 결과, 남은 문제. 완료한 작업마다 답의 끝에 `DONE[T<n>]` 한 줄을 따로 적는다.
+
+worker 가 `question` 으로 보고하면 세션이 그 질문을 사용자에게 전하고, 답을 그 worker 에게 `SendMessage` 로 보낸다.
+`-p` 세션에는 `AskUserQuestion` 이 없어 질문을 본문으로 한다.
+
+### 검증 규칙과 비용
+
+- 모든 작업의 결과를 검증한다. 한 줄짜리 찾기도 예외가 아니다.
+- verifier 는 **관점** 하나씩 맡는다: `requirements`(요구를 다 채웠나), `behavior`(실제로 동작하나 — 직접 실행),
+  `side-effects`(범위 밖이 바뀌지 않았나), `conventions`(프로젝트 규칙), `facts`(보고와 결과의 사실이 맞나).
+  requirements·behavior·side-effects 는 늘 하고, 파일을 바꿨으면 conventions, 사실을 다루면 facts 를 더한다.
+- verifier 는 서로의 결과를 보지 않는다. 읽기와 읽기 전용 검사·테스트만 하고 고치지 않는다 (Edit·Write 가 없다).
+  PASS 에는 직접 확인한 근거가 있어야 하고, 확인할 수 없거나 의심이 남으면 FAIL 이다. FAIL 에는 재현 가능한 근거(file:line, 명령과 출력)가 붙는다.
+  worker 가 ARTIFACTS 에 적은 파일은 관점과 상관없이 모든 verifier 가 확인한다: 없거나 설명과 다르면 FAIL 이다.
+- ROUND 1 은 `verifier-xhigh` (opus. 크거나 위험한 변경과 fable 이 한 일은 fable). 전부 PASS 여야 한다.
+  하나라도 FAIL 이면 그 근거로 다시 작업하고, 모든 관점을 ROUND+1 로 `verifier-max` (같은 모델)에서 새 verifier 가 다시 검증한다.
+  재작업은 2번까지, 그 뒤는 근거와 함께 사용자에게. 요구를 해석하는 차이에서 온 FAIL 은 사용자에게 묻는다.
+- `DONE[T<n>]` 은 마지막 ROUND 에서 서로 다른 verifier 가 서로 다른 관점 3개 이상을 PASS 하고 FAIL 이 없을 때만 쓸 수 있다.
+  그 작업의 마지막 worker 보고 뒤에 나온 판정만 센다 (재작업이나 대화 되감기 전의 판정은 세지 않는다).
+  이르게 쓰면 Stop 훅이 막고 무엇이 빠졌는지 알려 준다. 문장 속에 쓴 표시는 완료 주장으로 보지 않지만,
+  굵게·백틱·목록 기호·체크 표시 같은 서식이나 문장부호만 붙어 홀로 선 줄은 주장으로 본다.
+- **비용**: 작업 하나에 worker 1회 이상과 verifier 3회 이상(opus, xhigh)이 든다. 한 줄짜리 찾기도 에이전트가 최소 4개 돈다.
+  FAIL 이 나면 라운드마다 verifier-max 가 3회 이상 더 돈다. 품질이 중요한 일에 쓰고, 가벼운 일은 아래처럼 끄고 한다.
+
+### 끄기
+
+```bash
+claude --agent ""                                   # 이 세션만 보통 세션으로 (플러그인은 그대로)
+claude plugin disable delegate@j-ch-marketplace     # 끄기 (다음 세션부터). 다시 켜기는 enable
+```
+
+### workflowy 와 함께
+
+- 사용자가 `/workflowy:workstream <id>` 로 기록을 시작했을 때만 세션이 Workflowy 에 쓴다. worker 와 verifier 는 쓰지 않는다.
+- 세션은 그 스킬의 지침대로 요청 노드·계획·todo·결정·결과를 쓴다. 작업(T<n>)마다 todo 를 만들고, worker·verifier 를 띄울 때
+  description 끝에 ` @<todo id>` 를 붙여 그 todo 아래에 `▹` 로 기록되게 한다. 보고의 요지는 세션이 그 todo 아래에 쓰고,
+  검증이 끝나면 todo 를 닫는다.
+- workflowy 플러그인이 설치·설정되어 있어야 한다. delegate 만 설치해도 기록 없이 돈다.
+
+### 동작 방식
+
+| 구성 | 역할 |
+|---|---|
+| `settings.json` (`{"agent": "delegate:session"}`) | 플러그인이 켜져 있는 동안 메인 세션을 `delegate:session` 으로 띄운다 |
+| `agents/session.md` | 세션 역할. 도구는 allowlist 뿐 (Agent·SendMessage·TaskStop·Monitor·ToolSearch·AskUserQuestion·ListAgents·PushNotification·plan mode·workflowy 도구 셋). 모델·effort 는 사용자 설정을 따른다 |
+| `agents/worker-low.md` · `worker-medium.md` · `worker-xhigh.md` | worker. 본문은 같고 effort 만 low·medium·xhigh. 에이전트를 띄울 수 없다 |
+| `agents/verifier-xhigh.md` · `verifier-max.md` | verifier. 본문은 같고 effort 만 xhigh·max. 에이전트를 띄우거나 파일을 고칠 수 없다 |
+| SessionStart 훅 | 세부 파일 폴더(`state/<세션 id>/details/`)를 만들고, 그 폴더와 watchdog 의 Monitor 명령을 세션 context 에 넣는다 |
+| PreToolUse 훅 `guard` | 세션의 allowlist 밖 도구, watchdog 명령이 아닌 Monitor, `delegate:worker-*` · `delegate:verifier-*` 가 아닌 spawn, opus·fable 이 아닌 verifier, 보고를 낸 뒤 아직 끝나지 않은 agent(SubagentStop·완료 알림·foreground 반환 전. TaskStop 뒤에는 중단 알림 전)에게 보내는 `SendMessage` 를 거부. 받는 쪽은 agent id, 7자 이상의 id 앞부분, spawn 이름으로 알아보고 앞뒤 공백·끝의 ` [ref]`·대소문자는 가리지 않는다 (여럿에 맞거나 모르는 대상은 허용) |
+| 보고 게이트 (SubagentHandback 훅) | 형식이 틀린 worker·verifier 보고를 거부해 고쳐 보내게 한다. 받아들인 보고는 TASK 와 함께 적고, verifier 판정은 ledger 에도 적는다 |
+| 기록 훅 (SubagentStart·SubagentStop·TaskStop·Agent·UserPromptSubmit) | worker 의 시작과 끝(보고, 중단, 턴 한도, 완료 알림, foreground 로 띄운 worker 의 반환)을 적는다. 보고 없이 멈춘 agent(SubagentStop)는 Claude Code 가 보고를 재촉해 다시 돌리므로 끝으로 치지 않고, 재개한 뒤에야 도착한 중단(killed) 알림도 끝으로 치지 않는다. 완료 알림·agent 메시지 턴에는 사용자 언어로 답하라는 한 줄을 넣는다. watchdog 이 이 기록을 읽는다. 기록은 세션마다 플러그인 데이터 폴더의 `state/<세션 id>/` 에 쌓인다 |
+| Stop 훅 | `DONE[T<n>]` 과 서식·문장부호만 있는 줄(`**DONE[T1]**`, `` `DONE[T1]` ``, `- DONE[T1]`, `DONE[T1].`, `> DONE[T1]`, `1. DONE[T1]`, `✅ DONE[T1]` 등)을 완료 주장으로 보고, 문장 속 언급은 세지 않는다. 그 작업의 마지막 worker 보고 뒤 판정으로 검증이 모자라면 막고 빠진 것을 알린다. 절대 통과시키지 않고, 한 작업을 3번 막은 뒤로는 그 줄을 지우고 사용자에게 검증이 끝나지 않았다고 말하라고 한다 |
+| `scripts/watchdog.py` | Monitor 로 도는 감시 프로세스. `STALL`·`STALL2`·`ACTIVE <agent_id>` 를 출력하고, 활동이 없으면 끝난다. 세션마다 하나만 돈다: 새로 뜨면 이전 것은 조용히 끝난다 (Monitor 는 10–30분이면 끝나므로 세션이 끝났다는 알림 뒤에 다시 건다) |
+
+훅은 `scripts/delegate.py` 가 맡는다.
+
+### 주의
+
+- 세션에는 Read·Edit·Bash 가 없다. 파일 하나를 보는 일도 worker 가 한다. 그래서 답이 느리고 비싸다.
+- worker 는 이름이 report·summary·findings·analysis 로 시작하는 `.md` 를 만들 수 없다 (Claude Code 의 제한). 세부는 세션의 details 폴더의 `T<n>-details.md` 에 둔다.
+- auto 모드는 worker 보고를 데이터 유출 의심으로 표시할 수 있다. 보고는 그래도 전달된다.
+- haiku 는 effort 를 무시한다. 역할의 effort 는 사용자 설정보다 우선한다.
+
+### 업데이트
+
+```bash
+claude plugin update delegate
+```
+
+유지보수자는 `plugins/delegate/.claude-plugin/plugin.json` 의 `version` 을 올리고
+push 해야 사용자에게 갱신이 전달된다.
+
+### 제거
+
+```bash
+claude plugin uninstall delegate
+```

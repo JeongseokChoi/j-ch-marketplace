@@ -10,6 +10,11 @@
       "name": "workflowy",
       "source": "./plugins/workflowy",
       "description": "Workflowy 노드 하나를 작업 흐름(workstream)의 기록으로 삼아, Claude Code 세션들이 그 아래에 작업 과정을 이어서 정리해 기록한다."
+    },
+    {
+      "name": "delegate",
+      "source": "./plugins/delegate",
+      "description": "메인 세션은 판단만 하고(요청 정리·계획·배치·감시·검증·보고), 손이 가는 일은 모두 worker 서브에이전트에게 맡기며, 결과는 서로 독립인 verifier 3개 이상이 PASS 해야 완료로 본다."
     }
   ]
 }
