@@ -2,7 +2,7 @@
 
 Claude Code 플러그인 모음.
 
-## workflowy — Workflowy Workstream Log
+## workflowy
 
 Workflowy 노드 하나를 작업 흐름(workstream)의 기록으로 삼아, Claude Code 세션들이 그 아래에 작업 과정을
 이어서 정리해 기록한다.
@@ -250,6 +250,7 @@ Claude 는 todo 를 `close` 도구로 닫으면서 어떻게 닫는지 고른다
 4.1 부터 도구의 description 끝에 `@<todo id>` 를 붙이면 그 도구 실행을 그 todo 아래에 붙인다 (위 **기록되는 구조**).
 병렬 subagent 의 기록이 트리 순서로 첫 열린 todo 에 몰리던 것을 트랙마다 나눠 담을 수 있다. `@` 가 없으면 전과 같다.
 4.2 부터 `/workflowy:workstream` 을 인자 없이 부르면 사용법을 안내한다. 현재 상태는 `/workflowy:workstream status` 로 본다.
+4.2.1 은 플러그인 표시 이름을 `Workflowy Workstream Log` 에서 `Workflowy` 로 바꿨다. 동작은 같다.
 
 ### 2.x 에서 옮겨 오기
 

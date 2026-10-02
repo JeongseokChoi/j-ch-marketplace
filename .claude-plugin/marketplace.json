@@ -9,7 +9,7 @@
     {
       "name": "workflowy",
       "source": "./plugins/workflowy",
-      "description": "Workflowy 노드 하나를 작업 흐름(workstream)의 기록으로 삼아, Claude Code 세션들이 그 아래에 작업 과정을 이어서 정리해 기록한다."
+      "description": "Workflowy 노드 하나를 작업 흐름(workstream)의 기록으로 삼아 Claude Code 세션들이 그 아래에 작업 과정을 이어서 정리해 기록하고, 노드 하나와 그 하위 전체를 파일로 받아 Claude 에게 읽힌다."
     }
   ]
 }
