@@ -28,7 +28,8 @@ claude plugin install workflowy@j-ch-marketplace --config api_key=<WORKFLOWY_API
 /workflowy:workstream daa0961ddeee                        # 이 노드 아래에 기록 시작 (short id)
 /workflowy:workstream https://workflowy.com/#/daa0961ddeee  # URL 도 된다
 /workflowy:workstream daa0961ddeee 로그인 오류 고쳐줘       # id 뒤의 글은 첫 요청으로 전달된다
-/workflowy:workstream                                     # 현재 상태: root, 쓴 노드, 지금 작업 중인 노드
+/workflowy:workstream                                     # 사용법 안내
+/workflowy:workstream status                              # 현재 상태: root, 쓴 노드, 지금 작업 중인 노드
 /workflowy:workstream sync                                # Workflowy 에서 root 아래 전체를 다시 받아 cache 를 새로 채우기
 /workflowy:workstream clear-cache                         # cache 비우기 (옛 cache 에서 이어 오던 값을 끊는다)
 /workflowy:workstream stop                                # 기록 중단 (쓴 노드는 그대로)
@@ -51,7 +52,7 @@ claude plugin install workflowy@j-ch-marketplace --config api_key=<WORKFLOWY_API
   노드마다 API 를 한 번씩 부르므로 시간이 걸린다 (병렬 8개. 노드 350개쯤이면 20초 남짓).
   그래서 **백그라운드에서 읽는다**: 훅은 프로세스를 띄우고 곧바로 끝나고(훅 timeout 과 무관, 시간 제한 없음),
   다 읽으면 결과가 사용자의 다음 메시지나 Claude 의 다음 workflowy 도구 결과 뒤에 한 번 전해진다.
-  도는 동안은 `/workflowy:workstream` 에 진행 상황(읽은 노드 수, 호출 수, 한도 대기 횟수, 경과 시간)이 보인다.
+  도는 동안은 `/workflowy:workstream status` 에 진행 상황(읽은 노드 수, 호출 수, 한도 대기 횟수, 경과 시간)이 보인다.
   노드 수에는 ▹ 도구 실행 노드를 세지 않으므로 끝난 뒤 알리는 수와 같은 기준이다.
   결과를 전하기 전에 `sync` 를 다시 부르면 앞 결과를 먼저 전하고 새로 읽는다.
   Workflowy 의 요청 한도(HTTP 429)에 걸리면 모든 호출을 멈추고 기다렸다가 다시 읽는다. `Retry-After` 가 있으면 그 값
@@ -248,6 +249,7 @@ Claude 는 todo 를 `close` 도구로 닫으면서 어떻게 닫는지 고른다
 4.0.1 은 `/look-tree` 로 줄여 부르면 `Unknown command` 가 나던 것을 고쳤다 (description 의 콜론이 frontmatter 를 깨뜨렸다).
 4.1 부터 도구의 description 끝에 `@<todo id>` 를 붙이면 그 도구 실행을 그 todo 아래에 붙인다 (위 **기록되는 구조**).
 병렬 subagent 의 기록이 트리 순서로 첫 열린 todo 에 몰리던 것을 트랙마다 나눠 담을 수 있다. `@` 가 없으면 전과 같다.
+4.2 부터 `/workflowy:workstream` 을 인자 없이 부르면 사용법을 안내한다. 현재 상태는 `/workflowy:workstream status` 로 본다.
 
 ### 2.x 에서 옮겨 오기
 

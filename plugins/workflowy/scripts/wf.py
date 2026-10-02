@@ -2,7 +2,7 @@
 """
 wf.py - workflowy 플러그인의 훅. 기록 내용은 Claude 가 MCP 도구(mcp.py)로 직접 쓰고, 훅은 그 주변을 맡는다.
 
-  prompt         UserPromptSubmit  /workflowy:workstream <id> | sync | clear-cache | stop | doctor | (없음: 상태)
+  prompt         UserPromptSubmit  /workflowy:workstream <id> | status | sync | clear-cache | stop | doctor | (없음: 사용법)
   guard          PreToolUse        workflowy 도구 호출 검사 — root 아래, 이 세션이 만들었거나 이어받은 노드만 허용 (쓰기·읽기)
   track          PostToolUse       workflowy 도구가 만든 노드와 닫은 todo 를 state 에 기록
   step           PreToolUse        그 밖의 도구 실행을 지금 작업 중인 노드 아래에 자동으로 붙인다
@@ -402,7 +402,7 @@ def start_sync(st, sid, spawn=None):
         "[workflowy] sync 를 백그라운드에서 시작했다: Workflowy 에서 root 아래 전체를 끝까지 읽어 cache 를 새로 받는다 (시간 제한 없음). "
         "끝나면 사용자의 다음 메시지나 workflowy 도구 결과 뒤에 결과를 알린다. 그 전까지는 지금 기록으로 일하고, "
         "sync 결과(다른 PC 의 기록, Workflowy 에서 고친 내용)가 필요한 일은 결과가 온 뒤에 한다. "
-        "진행 상황은 /workflowy:workstream 로 볼 수 있다고 사용자에게 알린다."])
+        "진행 상황은 /workflowy:workstream status 로 볼 수 있다고 사용자에게 알린다."])
 
 
 def launch(sid):
@@ -687,6 +687,14 @@ REMIND = ("[workflowy] 이 세션은 Workflowy 에 기록 중이다. 이 요청�
           "도구 description 은 사용자의 언어로, 명사형으로 짧게 쓴다 — 그대로 기록된다. "
           "병렬 subagent 처럼 동시에 진행하는 일은 description 끝에 @<todo id> 를 붙여 그 todo 아래에 붙인다.")
 
+USAGE = ("[workflowy] 사용법\n"
+         "/workflowy:workstream <노드 id 또는 URL> [첫 요청]   이 노드 아래에 기록 시작\n"
+         "/workflowy:workstream status        현재 상태 (root, 쓴 노드, 지금 작업 중인 노드)\n"
+         "/workflowy:workstream sync          Workflowy 에서 root 아래 전체를 다시 받아 cache 새로 채우기\n"
+         "/workflowy:workstream clear-cache   cache 비우기\n"
+         "/workflowy:workstream stop          기록 중단\n"
+         "/workflowy:workstream doctor        설정·연결 점검")
+
 
 def clear_cache(st, sid):
     """clear-cache: 이 root 의 cache 를 비우고, 이 세션이 이어받은 노드도 요청과 이 세션이 쓴 노드의 조상만 남긴다.
@@ -725,7 +733,9 @@ def h_prompt(ev, st, sid, arg):
         say = [x for x in (sync_news(sid), REMIND if st.get("root") and by_user else None) if x]
         return "\n".join(say) or None
     a = arg.strip()
-    if a in ("", "status"):
+    if a == "":
+        return USAGE
+    if a == "status":
         if not st.get("root"):
             return "[workflowy] 기록 중인 세션이 없습니다."
         return "\n".join(x for x in ("[workflowy] " + summary(st, sid), sync_news(sid)) if x)

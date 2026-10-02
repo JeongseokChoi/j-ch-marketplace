@@ -1,7 +1,7 @@
 ---
 name: workstream
-description: 사용자가 지정한 Workflowy 노드 하나를 작업 흐름(workstream)의 기록으로 삼아, 이 세션의 작업 과정을 그 아래에 이어서 정리해 쓴다. 그 노드 아래에 이미 있는 기록은 이어받는다. 사용자가 /workflowy:workstream <노드 id> 로 시작하고, sync 로 Workflowy 의 전체 트리를 다시 받아 cache 를 새로 채우고, clear-cache 로 cache 를 비우고, stop 으로 멈추고, doctor 로 점검한다.
-argument-hint: <노드 id 또는 URL> | sync | clear-cache | stop | doctor
+description: 사용자가 지정한 Workflowy 노드 하나를 작업 흐름(workstream)의 기록으로 삼아, 이 세션의 작업 과정을 그 아래에 이어서 정리해 쓴다. 그 노드 아래에 이미 있는 기록은 이어받는다. 사용자가 /workflowy:workstream <노드 id> 로 시작하고, sync 로 Workflowy 의 전체 트리를 다시 받아 cache 를 새로 채우고, clear-cache 로 cache 를 비우고, stop 으로 멈추고, status 로 현재 상태를 보고, doctor 로 점검한다. 인자 없이 부르면 사용법을 안내한다.
+argument-hint: <노드 id 또는 URL> | status | sync | clear-cache | stop | doctor
 disable-model-invocation: true
 ---
 
@@ -15,7 +15,8 @@ disable-model-invocation: true
 | `sync` | Workflowy 에서 root 아래 전체를 다시 받아 cache 를 통째로 바꾸는 백그라운드 프로세스를 띄우고 곧바로 끝난다 | 결과가 올 때까지 지금 기록으로 일한다. 결과는 다음 사용자 메시지나 workflowy 도구 결과 뒤에 `[workflowy] sync 끝남` 으로 온다 (앞 sync 의 결과를 아직 전하지 않았으면 이 응답에 먼저 붙는다). 그 트리로 흐름을 다시 파악하고, 끝나지 않은 todo 가 있으면 사용자에게 묻는다 (아래 **이어받기**) |
 | `clear-cache` | 이 root 의 cache 를 비우고, 이 세션이 이어받은 노드도 요청과 이 세션이 쓴 노드의 조상만 남긴다 | 결과로 온 트리만 믿는다. 빠진 노드는 parent 로 쓰지 않고, read 로 읽지 않고, 판단의 근거로 삼지 않는다. 요청의 하위가 필요하면 sync 를 권한다 |
 | `stop` | 기록 중단 | 이후 workflowy 도구를 쓰지 않는다 |
-| `doctor`, 없음 | 점검·현재 상태 | 결과를 사용자에게 그대로 전한다 |
+| `status`, `doctor` | 현재 상태·점검 | 결과를 사용자에게 그대로 전한다 |
+| 없음 | 사용법 안내 | 사용법을 사용자에게 그대로 전한다 |
 
 id 뒤에 적힌 나머지 글은 사용자의 첫 요청이다.
 
